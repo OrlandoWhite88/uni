@@ -1,0 +1,8 @@
+# Section III: Animal, Vegetable or Microbial Fats and Oils (Chapter 15)
+
+SECTION_03_NOTES = """
+SECTION III - ANIMAL, VEGETABLE OR MICROBIAL FATS AND OILS AND THEIR CLEAVAGE PRODUCTS; PREPARED EDIBLE FATS; ANIMAL OR VEGETABLE WAXES
+
+(No section-level notes - see Chapter 15)
+"""
+

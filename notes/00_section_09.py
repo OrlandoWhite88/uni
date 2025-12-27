@@ -1,0 +1,8 @@
+# Section IX: Wood and Articles of Wood; Cork; Straw, Esparto (Chapters 44-46)
+
+SECTION_09_NOTES = """
+SECTION IX - WOOD AND ARTICLES OF WOOD; WOOD CHARCOAL; CORK AND ARTICLES OF CORK; MANUFACTURES OF STRAW, OF ESPARTO OR OF OTHER PLAITING MATERIALS; BASKETWARE AND WICKERWORK
+
+(No section-level notes - see individual chapters 44-46)
+"""
+

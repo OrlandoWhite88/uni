@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+requests
+google-auth
+google-genai
+groq
+openai
+pandas
+openpyxl
+rank-bm25

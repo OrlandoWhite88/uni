@@ -1,0 +1,8 @@
+# Section VIII: Raw Hides and Skins, Leather, Furskins and Articles Thereof (Chapters 41-43)
+
+SECTION_08_NOTES = """
+SECTION VIII - RAW HIDES AND SKINS, LEATHER, FURSKINS AND ARTICLES THEREOF; SADDLERY AND HARNESS; TRAVEL GOODS, HANDBAGS AND SIMILAR CONTAINERS; ARTICLES OF ANIMAL GUT (OTHER THAN SILKWORM GUT)
+
+(No section-level notes - see individual chapters 41-43)
+"""
+

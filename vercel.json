@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "functions": {
+    "api/main.py": {
+      "maxDuration": 60,
+      "includeFiles": "{api/hts_data.json,tarrif.xlsx}"
+    }
+  },
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "api/main.py",
+      "headers": {
+        "Access-Control-Allow-Origin": "https://www.uni-customs.com",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "X-Requested-With, Content-Type, Accept",
+        "Access-Control-Allow-Credentials": "true"
+      }
+    }
+  ]
+}
