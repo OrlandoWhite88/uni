@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-TreeRL GRPO Training Script
+TreeRL GRPO Training Script (Fixed for Unsloth)
 
 Custom GRPO training loop for TreeRL with:
-- FP8 precision via Unsloth (for B300 GPU)
-- Online rollouts using standard generation
-- Continuation from existing SFT LoRA (orlandowhite/nemotron3_nano_sft)
+- 4-bit or BF16 precision via Unsloth (NO vLLM/fast_inference)
+- Online rollouts using standard HuggingFace generation
+- Proper LoRA adapter handling
 - Per-step R(s) weighting per TreeRL paper
 
-Usage:
-    python treerl_grpo_train.py --chapter 84 --num-rulings 50 --epochs 3
+Key fixes from original:
+1. Removed FP8 and fast_inference (vLLM) - use 4-bit instead
+2. Removed FastLanguageModel.for_inference() calls during training
+3. Fixed model mode management for train/eval switching
+4. Simplified generation to work with Unsloth in training context
 
-Based on TreeRL paper: https://github.com/THUDM/TreeRL
+Usage:
+    python treerl_grpo_train_fixed.py --chapter 84 --num-rulings 50 --epochs 3
 """
 
 import os
@@ -36,6 +40,7 @@ script_dir = Path(__file__).parent
 api_dir = script_dir / "api"
 sys.path.insert(0, str(api_dir))
 
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -46,36 +51,36 @@ class TreeRLConfig:
     
     # Model settings
     base_model: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-    sft_adapter: str = "orlandowhite/nemotron3_nano_sft"
-    max_seq_length: int = 131072  # 128k context
-    load_in_fp8: bool = True
-    use_fast_inference: bool = False  # Unsloth vLLM fast_inference path (optional)
+    sft_adapter: str = "orlandowhite/nemotron3_nano_sft"  # Continue from your SFT adapter
+    max_seq_length: int = 128000  
+    load_in_4bit: bool = True  # Use 4-bit quantization (recommended for memory)
+    offload_embedding: bool = False  # Disabled: causes device mismatch errors during generation
     rollout_max_new_tokens: int = 2048
-    rollout_temperature: float = 0.0
-    rollout_top_p: float = 1.0
-    # Local generation concurrency: ClassificationEngine uses thread pools.
-    # With a single GPU, default to 1 unless using vLLM fast_inference batching.
-    path_workers: int = 1
-    calibrate_workers: int = 1
+    rollout_temperature: float = 0.7  # Small temp for diversity in rollouts
+    rollout_top_p: float = 0.95
     
-    # LoRA settings (from existing SFT adapter)
+    # LoRA settings - MUST match your existing SFT adapter!
     lora_rank: int = 16
-    lora_alpha: int = 32
+    lora_alpha: int = 32  # typically 2x rank
+    lora_target_modules: Tuple[str, ...] = (
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    )
     
     # Training settings
-    learning_rate: float = 1e-5
+    learning_rate: float = 5e-5
     weight_decay: float = 0.01
     warmup_steps: int = 10
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 4
     max_grad_norm: float = 1.0
     
     # TreeRL settings
-    beam_size: int = 8
-    max_questions: int = 5
+    beam_size: int = 4  # Reduced for faster rollouts
+    max_questions: int = 3
     
     # Data settings
     chapter: str = "84"
-    num_rulings_per_epoch: int = 50
+    num_rulings_per_epoch: int = 20
     num_epochs: int = 3
     
     # Paths
@@ -122,61 +127,96 @@ def setup_logging(config: TreeRLConfig) -> logging.Logger:
 
 
 # ============================================================================
-# MODEL LOADING
+# MODEL LOADING (Simplified for Unsloth)
 # ============================================================================
 
 def load_model_and_tokenizer(config: TreeRLConfig, logger: logging.Logger):
     """
-    Load Nemotron 3 Nano with FP8 and existing SFT LoRA adapter.
+    Load model with Unsloth using 4-bit quantization.
+    
+    This is the CORRECT way to load for a custom training loop:
+    1. Load base model with FastLanguageModel.from_pretrained
+    2. Add LoRA adapters with FastLanguageModel.get_peft_model
+    3. Optionally load weights from existing adapter
     
     Returns:
-        model: The model with LoRA adapters loaded and trainable
+        model: The model with LoRA adapters ready for training
         tokenizer: The tokenizer
     """
-    logger.info("="*70)
-    logger.info("LOADING MODEL")
-    logger.info("="*70)
+    logger.info("=" * 70)
+    logger.info("LOADING MODEL WITH UNSLOTH")
+    logger.info("=" * 70)
     logger.info(f"Base model: {config.base_model}")
     logger.info(f"SFT adapter: {config.sft_adapter}")
-    logger.info(f"FP8 enabled: {config.load_in_fp8}")
+    logger.info(f"4-bit quantization: {config.load_in_4bit}")
     logger.info(f"Max sequence length: {config.max_seq_length}")
     
     try:
         from unsloth import FastLanguageModel
         
-        # Load base model with FP8
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=config.base_model,
-            max_seq_length=config.max_seq_length,
-            load_in_fp8=config.load_in_fp8,
-            fast_inference=config.use_fast_inference,  # Optional vLLM-backed inference
-            trust_remote_code=True,
-        )
+        if config.sft_adapter:
+            # OPTION 1: Load existing adapter directly
+            # This is the CORRECT way to continue training an existing LoRA
+            logger.info(f"Loading model with existing SFT adapter: {config.sft_adapter}")
+            
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=config.sft_adapter,  # Load adapter directly!
+                max_seq_length=config.max_seq_length,
+                load_in_4bit=config.load_in_4bit,
+                offload_embedding=config.offload_embedding,
+                trust_remote_code=True,
+            )
+            logger.info("Model + SFT adapter loaded successfully")
+            
+            # The adapter is already attached - just make sure it's trainable
+            # Unsloth should have set this up, but let's verify
+            for name, param in model.named_parameters():
+                if "lora" in name.lower():
+                    param.requires_grad = True
+            
+            # Get the LoRA rank from loaded adapter for logging
+            loaded_rank = "unknown"
+            for name, param in model.named_parameters():
+                if "lora_A" in name:
+                    loaded_rank = param.shape[0]
+                    break
+            logger.info(f"Loaded adapter LoRA rank: {loaded_rank}")
+            
+        else:
+            # OPTION 2: Fresh LoRA from base model
+            logger.info("Loading base model and creating fresh LoRA adapters")
+            
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=config.base_model,
+                max_seq_length=config.max_seq_length,
+                load_in_4bit=config.load_in_4bit,
+                offload_embedding=config.offload_embedding,
+                trust_remote_code=True,
+            )
+            logger.info("Base model loaded successfully")
+            
+            model = FastLanguageModel.get_peft_model(
+                model,
+                r=config.lora_rank,
+                target_modules=list(config.lora_target_modules),
+                lora_alpha=config.lora_alpha,
+                lora_dropout=0.0,
+                bias="none",
+                use_gradient_checkpointing="unsloth",
+                random_state=3407,
+            )
+            logger.info(f"Fresh LoRA adapters added (rank={config.lora_rank}, alpha={config.lora_alpha})")
         
-        logger.info("Base model loaded successfully with Unsloth FP8")
-        
-        # Load existing SFT LoRA adapter
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(
-            model,
-            config.sft_adapter,
-            is_trainable=True,  # Continue training
-        )
-        
-        logger.info(f"SFT LoRA adapter loaded: {config.sft_adapter}")
-        
-        # Enable gradient checkpointing for memory efficiency
-        if hasattr(model, 'gradient_checkpointing_enable'):
-            model.gradient_checkpointing_enable()
-            logger.info("Gradient checkpointing enabled")
+        USING_UNSLOTH = True
         
     except ImportError as e:
         logger.warning(f"Unsloth not available ({e}), falling back to standard loading")
+        USING_UNSLOTH = False
         
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import PeftModel
+        from peft import get_peft_model, LoraConfig
         
-        # Standard loading without FP8
+        # Standard loading without Unsloth
         model = AutoModelForCausalLM.from_pretrained(
             config.base_model,
             torch_dtype=torch.bfloat16,
@@ -189,14 +229,24 @@ def load_model_and_tokenizer(config: TreeRLConfig, logger: logging.Logger):
             trust_remote_code=True,
         )
         
-        # Load LoRA adapter
-        model = PeftModel.from_pretrained(
-            model,
-            config.sft_adapter,
-            is_trainable=True,
+        # Add LoRA
+        lora_config = LoraConfig(
+            r=config.lora_rank,
+            lora_alpha=config.lora_alpha,
+            target_modules=list(config.lora_target_modules),
+            lora_dropout=0.0,
+            bias="none",
         )
+        model = get_peft_model(model, lora_config)
         
-        logger.info("Model loaded with standard transformers (no FP8)")
+        if config.sft_adapter:
+            try:
+                model.load_adapter(config.sft_adapter, adapter_name="sft")
+                model.set_adapter("sft")
+            except Exception as e:
+                logger.warning(f"Could not load adapter: {e}")
+        
+        logger.info("Model loaded with standard transformers")
     
     # Ensure padding token exists
     if tokenizer.pad_token is None:
@@ -209,24 +259,21 @@ def load_model_and_tokenizer(config: TreeRLConfig, logger: logging.Logger):
     logger.info(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
     logger.info(f"Total parameters: {total_params:,}")
     
-    return model, tokenizer
+    return model, tokenizer, USING_UNSLOTH
 
 
 # ============================================================================
-# LOCAL LLM CLIENT (Unsloth-backed) FOR ONLINE ROLLOUTS
+# LOCAL LLM CLIENT FOR ONLINE ROLLOUTS
 # ============================================================================
 
-class LocalUnslothLLMClient:
+class LocalLLMClient:
     """
-    Drop-in replacement for api.llm_client.LLMClient which runs prompts through a
-    local model/tokenizer using Unsloth (or plain HF model.generate).
-
-    The classification stack calls:
-      - send_openai_request(prompt=..., requires_json=..., temperature=...)
-      - send_trajectory_request(messages=[...], requires_json=..., temperature=...)
-      - send_vertex_ai_request(...) (alias)
-
-    We keep those method names so we can inject this object into HTSTree.
+    Local LLM client for rollouts during training.
+    
+    Key differences from original:
+    1. NO FastLanguageModel.for_inference() calls - this breaks training
+    2. Simple model.eval() / model.train() switching
+    3. Standard HuggingFace generation
     """
 
     def __init__(
@@ -239,10 +286,8 @@ class LocalUnslothLLMClient:
         max_new_tokens: int,
         temperature: float,
         top_p: float,
-        debug_log_prompts: bool = False,
+        logger: logging.Logger,
     ):
-        from api.system_prompts_updated import UNIFIED_SYSTEM_PROMPT
-
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
@@ -250,16 +295,22 @@ class LocalUnslothLLMClient:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
-
-        self.system_prompt = UNIFIED_SYSTEM_PROMPT.strip()
-
-        # mimic LLMClient attributes used by ClassificationEngine
-        self.log_prompts = debug_log_prompts
-        self.prompt_logger = logging.getLogger("local_llm_prompts")
-
+        self.logger = logger
+        
+        # Try to load system prompt from your API
+        try:
+            from api.system_prompts_updated import UNIFIED_SYSTEM_PROMPT
+            self.system_prompt = UNIFIED_SYSTEM_PROMPT.strip()
+        except ImportError:
+            self.system_prompt = "You are a helpful assistant."
+        
         self._system_prompt_injection: Optional[str] = None
-
-        # Match api.llm_client JSON_REQUIREMENTS behavior
+        
+        # Compatibility attributes expected by classification_engine.py
+        self.log_prompts = False  # Disable verbose prompt logging during training
+        self.prompt_logger = logger  # Use same logger if needed
+        
+        # JSON requirements for structured outputs
         self._json_requirements = (
             "CRITICAL JSON REQUIREMENTS:\n"
             "- Return ONLY valid JSON with no additional text\n"
@@ -279,6 +330,7 @@ class LocalUnslothLLMClient:
         return (self._system_prompt_injection or self.system_prompt).strip()
 
     def _extract_json_from_response(self, response_text: str) -> str:
+        """Extract JSON from model response, handling code fences."""
         if not response_text:
             raise ValueError("No response text to parse.")
 
@@ -304,7 +356,7 @@ class LocalUnslothLLMClient:
         start_a = text.find("[")
         end_a = text.rfind("]")
         if start_a != -1 and end_a != -1 and end_a > start_a:
-            candidate = text[start_a : end_a + 1]
+            candidate = text[start_a:end_a + 1]
             try:
                 json.loads(candidate)
                 return candidate
@@ -315,7 +367,7 @@ class LocalUnslothLLMClient:
         start_o = text.find("{")
         end_o = text.rfind("}")
         if start_o != -1 and end_o != -1 and end_o > start_o:
-            candidate = text[start_o : end_o + 1]
+            candidate = text[start_o:end_o + 1]
             try:
                 json.loads(candidate)
                 return candidate
@@ -324,21 +376,25 @@ class LocalUnslothLLMClient:
 
         raise ValueError(f"Failed to extract valid JSON from response: {response_text[:200]}...")
 
+    @torch.no_grad()
     def _generate_from_messages(self, messages: List[Dict[str, str]], temperature: float) -> str:
-        # Unsloth recommends this for faster inference
-        try:
-            from unsloth import FastLanguageModel
-
-            FastLanguageModel.for_inference(self.model)
-        except Exception:
-            pass
-
+        """
+        Generate a response from a list of chat messages.
+        
+        IMPORTANT: We do NOT call FastLanguageModel.for_inference() here!
+        That method is for final inference only and breaks the training loop.
+        Instead, we just use model.eval() temporarily.
+        """
+        gen_start = time.time()
+        
+        # Apply chat template
         text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
         )
-
+        
+        # Tokenize
         inputs = self.tokenizer(
             text,
             return_tensors="pt",
@@ -346,28 +402,43 @@ class LocalUnslothLLMClient:
             max_length=self.max_seq_length,
         )
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        # Make sure generation doesn't accidentally run with gradients or in train mode.
+        input_len = inputs["input_ids"].shape[1]
+        
+        self.logger.debug(f"    [LLM] Generating... input_tokens={input_len}")
+        
+        # Temporarily switch to eval mode
         was_training = self.model.training
         self.model.eval()
-
-        do_sample = float(temperature) > 0.0
+        
         try:
+            do_sample = float(temperature) > 0.0
+            
+            # Standard HuggingFace generation
             gen = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=do_sample,
                 temperature=temperature if do_sample else None,
                 top_p=self.top_p if do_sample else None,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
                 use_cache=True,
             )
         finally:
+            # Restore training mode if it was active
             if was_training:
                 self.model.train()
-
+        
         # Decode only the newly generated tokens
-        output_ids = gen[0][inputs["input_ids"].shape[1] :]
-        return self.tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+        output_ids = gen[0][input_len:]
+        output_text = self.tokenizer.decode(output_ids, skip_special_tokens=True).strip()
+        
+        gen_elapsed = time.time() - gen_start
+        num_tokens = len(output_ids)
+        tok_per_sec = num_tokens / gen_elapsed if gen_elapsed > 0 else 0
+        self.logger.debug(f"    [LLM] Generated {num_tokens} tokens in {gen_elapsed:.1f}s ({tok_per_sec:.1f} tok/s)")
+        
+        return output_text
 
     def send_openai_request(
         self,
@@ -376,6 +447,7 @@ class LocalUnslothLLMClient:
         temperature: float = 0.0,
         **kwargs: Any,
     ) -> str:
+        """Send a single-turn request."""
         user_content = prompt.strip()
         if requires_json:
             user_content = f"{user_content.rstrip()}\n\n{self._json_requirements}"
@@ -385,13 +457,11 @@ class LocalUnslothLLMClient:
             {"role": "user", "content": user_content},
         ]
 
-        with torch.no_grad():
-            text = self._generate_from_messages(messages, temperature=temperature)
+        text = self._generate_from_messages(messages, temperature=temperature)
 
         if requires_json:
             cleaned = self._extract_json_from_response(text)
-            # validate
-            json.loads(cleaned)
+            json.loads(cleaned)  # Validate
             return cleaned
         return text
 
@@ -402,6 +472,7 @@ class LocalUnslothLLMClient:
         temperature: float = 0.0,
         **kwargs: Any,
     ) -> str:
+        """Send a multi-turn request."""
         req_messages = [m.copy() for m in messages]
         if requires_json:
             for i in range(len(req_messages) - 1, -1, -1):
@@ -409,16 +480,15 @@ class LocalUnslothLLMClient:
                     req_messages[i]["content"] = f"{req_messages[i]['content'].rstrip()}\n\n{self._json_requirements}"
                     break
 
-        with torch.no_grad():
-            text = self._generate_from_messages(req_messages, temperature=temperature)
+        text = self._generate_from_messages(req_messages, temperature=temperature)
 
         if requires_json:
             cleaned = self._extract_json_from_response(text)
-            json.loads(cleaned)
+            json.loads(cleaned)  # Validate
             return cleaned
         return text
 
-    # Legacy aliases used in a few places
+    # Aliases for compatibility
     def send_vertex_ai_request(self, *args, **kwargs) -> str:
         return self.send_openai_request(*args, **kwargs)
 
@@ -433,6 +503,10 @@ class LocalUnslothLLMClient:
 def load_chapter_rulings(config: TreeRLConfig, logger: logging.Logger) -> List[Dict]:
     """Load cross rulings filtered by chapter."""
     logger.info(f"Loading rulings from {config.cross_rulings_file}")
+    
+    if not os.path.exists(config.cross_rulings_file):
+        logger.error(f"Rulings file not found: {config.cross_rulings_file}")
+        return []
     
     with open(config.cross_rulings_file, 'r', encoding='utf-8') as f:
         all_rulings = json.load(f)
@@ -462,47 +536,33 @@ def find_assistant_turn_boundaries(
     Find token boundaries for each assistant turn in the conversation.
     
     Returns list of (start_idx, end_idx) tuples for each assistant response.
-    These correspond to the classification steps that get R(s) weighting.
     """
-    # Decode to find boundaries
-    full_text = tokenizer.decode(input_ids, skip_special_tokens=False)
-    
-    # Nemotron uses <|im_start|>assistant and <|im_end|> markers
-    # Find all assistant turn boundaries
     boundaries = []
+    input_list = input_ids.tolist()
     
-    # Get special tokens for the model
-    assistant_start = "<|im_start|>assistant"
-    turn_end = "<|im_end|>"
-    
-    # Alternative markers for different chat templates
-    alt_assistant_start = "assistant\n"
-    
-    current_pos = 0
-    assistant_count = 0
-    
-    # Tokenize the markers to find their positions
     for i, msg in enumerate(messages):
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "")
-            if not content:
-                continue
-            
-            # Find this content in the tokenized sequence
-            # This is approximate - we find the content tokens
-            content_tokens = tokenizer.encode(content, add_special_tokens=False)
-            
-            if len(content_tokens) > 0:
-                # Find where these tokens appear in input_ids
-                input_list = input_ids.tolist()
-                
-                # Search for the start of this content
-                for start_idx in range(len(input_list) - len(content_tokens) + 1):
-                    if input_list[start_idx:start_idx + min(5, len(content_tokens))] == content_tokens[:min(5, len(content_tokens))]:
-                        end_idx = start_idx + len(content_tokens)
-                        boundaries.append((start_idx, end_idx))
-                        assistant_count += 1
-                        break
+        if msg.get("role") != "assistant":
+            continue
+        
+        content = msg.get("content", "")
+        if not content:
+            continue
+        
+        # Tokenize this content to find it in the sequence
+        content_tokens = tokenizer.encode(content, add_special_tokens=False)
+        
+        if len(content_tokens) < 3:
+            continue
+        
+        # Search for the start of this content (use first few tokens as anchor)
+        search_len = min(5, len(content_tokens))
+        search_pattern = content_tokens[:search_len]
+        
+        for start_idx in range(len(input_list) - len(content_tokens) + 1):
+            if input_list[start_idx:start_idx + search_len] == search_pattern:
+                end_idx = start_idx + len(content_tokens)
+                boundaries.append((start_idx, end_idx))
+                break
     
     return boundaries
 
@@ -517,16 +577,6 @@ def build_token_weights(
     Build per-token weight tensor from step rewards.
     
     Each token in an assistant turn gets weighted by R(s) for that step.
-    Tokens outside assistant turns (user messages, system prompt) get weight 0.
-    
-    Args:
-        step_rewards: List of {"step": i, "R": r_value, ...} from sample
-        boundaries: List of (start, end) token indices for each assistant turn
-        seq_len: Total sequence length
-        device: Device to create tensor on
-        
-    Returns:
-        Tensor of shape [seq_len] with per-token weights
     """
     weights = torch.zeros(seq_len, device=device)
     
@@ -557,26 +607,13 @@ def compute_grpo_loss(
     """
     Compute GRPO loss with per-step R(s) weighting.
     
-    Per TreeRL paper:
-    - Policy gradient for tokens in step s is weighted by R(s)
-    - R(s) = (GA(s) + LA(s)) / sqrt(|L(s)|)
-    
-    This implements weighted negative log-likelihood where each token's
-    contribution is scaled by the R(s) of its containing step.
-    
-    Args:
-        model: The language model
-        input_ids: Input token IDs [1, seq_len]
-        attention_mask: Attention mask [1, seq_len]
-        step_rewards: Step reward info from training sample
-        boundaries: Token boundaries for assistant turns
-        device: Compute device
-        
-    Returns:
-        loss: Scalar loss tensor
-        metrics: Dict with loss components for logging
+    Loss = -sum(R(s) * log_prob(token)) for tokens in step s
     """
-    # Forward pass
+    # CRITICAL: Ensure we're in training mode with gradients enabled
+    assert model.training, "Model must be in training mode for loss computation"
+    assert torch.is_grad_enabled(), "Gradients must be enabled for loss computation"
+    
+    # Forward pass - model should be in training mode
     outputs = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -600,7 +637,6 @@ def compute_grpo_loss(
     ).squeeze(-1)  # [1, seq_len-1]
     
     # Build per-token weights from step rewards
-    # Adjust boundaries for the shift
     adjusted_boundaries = [(max(0, s-1), max(0, e-1)) for s, e in boundaries]
     weights = build_token_weights(
         step_rewards, 
@@ -608,11 +644,6 @@ def compute_grpo_loss(
         shift_labels.shape[1],
         device
     ).unsqueeze(0)  # [1, seq_len-1]
-    
-    # Compute weighted loss
-    # For tokens with positive R: we want to increase their probability
-    # For tokens with negative R: we want to decrease their probability
-    # Loss = -sum(R(s) * log_prob(token)) for tokens in step s
     
     # Apply mask and weights
     masked_log_probs = token_log_probs * shift_mask.float()
@@ -625,6 +656,9 @@ def compute_grpo_loss(
     else:
         # Fallback: standard CE loss if no weights
         loss = -masked_log_probs.sum() / shift_mask.sum().float()
+    
+    # Verify loss requires grad (sanity check)
+    assert loss.requires_grad, "Loss tensor must require gradients for training"
     
     # Compute metrics
     metrics = {
@@ -647,60 +681,66 @@ def run_online_rollout(
     ruling: Dict,
     config: TreeRLConfig,
     logger: logging.Logger,
-    local_llm: LocalUnslothLLMClient,
+    local_llm: LocalLLMClient,
 ) -> List[Dict]:
     """
     Run beam search rollout for a single ruling and compute TreeRL rewards.
-    
-    This uses the existing rollout infrastructure.
     
     Returns:
         List of training samples with messages and step_rewards
     """
     # Import TreeRL components
-    from api.treerl_gold_trace import build_gold_trace, build_pred_trace_from_path
-    from api.treerl_rewards import compute_leaf_reward
-    from api.treerl_process_supervision import compute_treerl_rewards, emit_leaf_samples
-    from llm_auto_responder import LLMAutoResponder
+    try:
+        from api.treerl_gold_trace import build_gold_trace, build_pred_trace_from_path
+        from api.treerl_rewards import compute_leaf_reward
+        from api.treerl_process_supervision import compute_treerl_rewards, emit_leaf_samples
+        from llm_auto_responder import LLMAutoResponder
+        from api.groq_tree_engine import HTSTree
+    except ImportError as e:
+        logger.error(f"Could not import TreeRL components: {e}")
+        return []
     
-    # Set beam size
+    # Set beam size via environment
     os.environ["TREERL_BEAM_SIZE"] = str(config.beam_size)
     os.environ["TREERL_CHAPTER_BEAM_SIZE"] = str(config.beam_size)
     os.environ["DISABLE_CROSS_RULING_INJECTION"] = "true"
-    
-    # Load classification engine (we'll inject our local LLM client)
-    from api.groq_tree_engine import HTSTree
     
     product_description = ruling.get("short_product_description", "")
     gold_code = ruling.get("hts_code", "")
     
     try:
-        # Create HTS tree
+        logger.debug(f"  [rollout] Creating HTSTree...")
         hts_tree = HTSTree()
-
-        # Inject local LLM client everywhere (no remote LLMClient calls)
+        
+        # Inject local LLM client
+        logger.debug(f"  [rollout] Injecting local LLM client...")
         hts_tree.llm_client = local_llm
-        hts_tree.client = None  # legacy field on HTSTree; we don't use network clients
+        hts_tree.client = None
         if hasattr(hts_tree, "classification_engine") and hasattr(hts_tree.classification_engine, "llm"):
             hts_tree.classification_engine.llm = local_llm
         if hasattr(hts_tree, "streaming_engine") and hasattr(hts_tree.streaming_engine, "llm_client"):
             hts_tree.streaming_engine.llm_client = local_llm
         
         # Load HTS data
+        logger.debug(f"  [rollout] Loading HTS data...")
         hts_data_file = script_dir / "api" / "hts_data.json"
-        with open(hts_data_file, "r", encoding="utf-8") as f:
-            hts_data = json.load(f)
-        hts_tree.build_from_json(hts_data)
+        if hts_data_file.exists():
+            with open(hts_data_file, "r", encoding="utf-8") as f:
+                hts_data = json.load(f)
+            hts_tree.build_from_json(hts_data)
         
         # Build gold trace
+        logger.debug(f"  [rollout] Building gold trace for {gold_code}...")
         gold_trace = build_gold_trace(gold_code, hts_tree.navigator)
         
-        # Initialize auto-responder for Q&A (also uses local LLM now)
+        # Initialize auto-responder
+        logger.debug(f"  [rollout] Initializing auto-responder...")
         auto_responder = LLMAutoResponder(engine_name="groq", debug=False)
         if hasattr(auto_responder, "llm_client"):
             auto_responder.llm_client = local_llm
         
-        # Run classification with auto-responses
+        # Run classification
+        logger.info(f"  [rollout] Starting classification (max_q={config.max_questions}, beam={config.beam_size})...")
         if config.max_questions > 0:
             result = auto_responder.interactive_classify_with_auto_response(
                 hts_tree=hts_tree,
@@ -716,6 +756,7 @@ def run_online_rollout(
                 use_multi_hypothesis=True,
                 hypothesis_count=config.beam_size
             )
+        logger.info(f"  [rollout] Classification complete")
         
         state = result.get("state", {})
         
@@ -730,7 +771,7 @@ def run_online_rollout(
                 path_id = path_data.get("path_id", "unknown")
             elif hasattr(path_data, "classification_path"):
                 classification_path = path_data.classification_path
-                trajectory = path_data.trajectory if hasattr(path_data, "trajectory") else []
+                trajectory = getattr(path_data, "trajectory", [])
                 path_id = path_data.path_id
             else:
                 continue
@@ -787,6 +828,8 @@ def run_online_rollout(
         
     except Exception as e:
         logger.error(f"Rollout error for '{product_description[:50]}': {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
         return []
 
 
@@ -802,15 +845,10 @@ def train_epoch(
     config: TreeRLConfig,
     logger: logging.Logger,
     epoch: int,
-    local_llm: LocalUnslothLLMClient,
+    local_llm: LocalLLMClient,
 ) -> Dict[str, float]:
     """
     Train for one epoch with online rollouts.
-    
-    For each ruling:
-    1. Run beam search rollout
-    2. Collect leaves with TreeRL rewards
-    3. Train on each trajectory with per-step R(s) weighting
     """
     model.train()
     
@@ -819,7 +857,6 @@ def train_epoch(
         "num_samples": 0,
         "num_rulings": 0,
         "avg_reward": 0.0,
-        "avg_v_root": 0.0,
     }
     
     # Sample rulings for this epoch
@@ -833,11 +870,13 @@ def train_epoch(
     accumulated_loss = 0.0
     accumulated_steps = 0
     
+    optimizer.zero_grad()
+    
     for ruling_idx, ruling in enumerate(epoch_rulings):
         product_desc = ruling.get("short_product_description", "")[:50]
         logger.info(f"  Ruling {ruling_idx+1}/{len(epoch_rulings)}: {product_desc}...")
         
-        # Run online rollout (on-policy local model)
+        # Run online rollout
         samples = run_online_rollout(ruling, config, logger, local_llm)
         
         if not samples:
@@ -883,11 +922,10 @@ def train_epoch(
                 input_ids[0], tokenizer, messages
             )
             
-            if not boundaries:
-                logger.debug("No assistant boundaries found, using uniform weights")
-            
             # Compute GRPO loss
             try:
+                model.train()  # Ensure training mode
+                
                 loss, metrics = compute_grpo_loss(
                     model,
                     input_ids,
@@ -910,21 +948,29 @@ def train_epoch(
                 
             except Exception as e:
                 logger.error(f"Loss computation error: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
                 continue
             
             # Gradient accumulation step
             if accumulated_steps >= config.gradient_accumulation_steps:
-                # Clip gradients
+                # Verify gradients are flowing (first time only)
+                if epoch_metrics["num_samples"] <= config.gradient_accumulation_steps:
+                    lora_grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
+                    if lora_grads:
+                        grad_norm = torch.sqrt(sum(g.pow(2).sum() for g in lora_grads)).item()
+                        logger.info(f"    Gradient check: {len(lora_grads)} LoRA params have grads, norm={grad_norm:.4f}")
+                    else:
+                        logger.warning("    WARNING: No gradients computed for LoRA parameters!")
+                
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), 
                     config.max_grad_norm
                 )
                 
-                # Optimizer step
                 optimizer.step()
                 optimizer.zero_grad()
                 
-                # Log
                 avg_acc_loss = accumulated_loss / accumulated_steps
                 logger.info(f"    Step loss: {avg_acc_loss:.4f}")
                 
@@ -938,6 +984,12 @@ def train_epoch(
                 f"  Progress: {ruling_idx+1}/{len(epoch_rulings)} rulings, "
                 f"{epoch_metrics['num_samples']} samples, avg_loss={avg_loss:.4f}"
             )
+        
+        # Free memory periodically
+        if (ruling_idx + 1) % 5 == 0:
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
     
     # Handle remaining gradients
     if accumulated_steps > 0:
@@ -965,20 +1017,28 @@ def train(config: TreeRLConfig):
     # Setup logging
     logger = setup_logging(config)
     
-    logger.info("="*70)
-    logger.info("TREERL GRPO TRAINING")
-    logger.info("="*70)
+    logger.info("=" * 70)
+    logger.info("TREERL GRPO TRAINING (FIXED FOR UNSLOTH)")
+    logger.info("=" * 70)
     logger.info(f"Config: {config}")
     
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
     
     # Load model and tokenizer
-    model, tokenizer = load_model_and_tokenizer(config, logger)
-    model.to(config.device)
-
-    # Local LLM client for ONLINE rollouts (classification calls)
-    local_llm = LocalUnslothLLMClient(
+    logger.info("Loading model and tokenizer...")
+    model, tokenizer, using_unsloth = load_model_and_tokenizer(config, logger)
+    
+    # Note: With Unsloth, model is already on the correct device
+    # Only move if not using Unsloth
+    if not using_unsloth:
+        logger.info(f"Moving model to {config.device}...")
+        model.to(config.device)
+    logger.info("Model ready")
+    
+    # Create local LLM client for rollouts
+    logger.info("Creating LocalLLMClient for rollouts...")
+    local_llm = LocalLLMClient(
         model=model,
         tokenizer=tokenizer,
         device=config.device,
@@ -986,8 +1046,9 @@ def train(config: TreeRLConfig):
         max_new_tokens=config.rollout_max_new_tokens,
         temperature=config.rollout_temperature,
         top_p=config.rollout_top_p,
-        debug_log_prompts=False,
+        logger=logger,
     )
+    logger.info("LocalLLMClient ready")
     
     # Load data
     rulings = load_chapter_rulings(config, logger)
@@ -996,16 +1057,29 @@ def train(config: TreeRLConfig):
         logger.error(f"No rulings found for chapter {config.chapter}")
         return
     
-    # Setup optimizer
+    # Setup optimizer - only train LoRA parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = AdamW(
-        model.parameters(),
+        trainable_params,
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
     
-    logger.info("="*70)
+    # Verify LoRA setup
+    lora_param_count = sum(p.numel() for p in trainable_params)
+    frozen_param_count = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    logger.info(f"Training setup verification:")
+    logger.info(f"  Trainable (LoRA) parameters: {lora_param_count:,}")
+    logger.info(f"  Frozen (base) parameters: {frozen_param_count:,}")
+    logger.info(f"  Optimizer param groups: {len(optimizer.param_groups)}")
+    
+    if lora_param_count == 0:
+        logger.error("NO TRAINABLE PARAMETERS! LoRA setup may have failed.")
+        return
+    
+    logger.info("=" * 70)
     logger.info("STARTING TRAINING")
-    logger.info("="*70)
+    logger.info("=" * 70)
     
     training_start = time.time()
     all_metrics = []
@@ -1013,9 +1087,9 @@ def train(config: TreeRLConfig):
     for epoch in range(config.num_epochs):
         epoch_start = time.time()
         
-        logger.info(f"\n{'='*70}")
+        logger.info(f"\n{'=' * 70}")
         logger.info(f"EPOCH {epoch + 1}/{config.num_epochs}")
-        logger.info(f"{'='*70}")
+        logger.info(f"{'=' * 70}")
         
         # Train epoch
         epoch_metrics = train_epoch(
@@ -1051,9 +1125,9 @@ def train(config: TreeRLConfig):
     # Training complete
     total_time = time.time() - training_start
     
-    logger.info("\n" + "="*70)
+    logger.info("\n" + "=" * 70)
     logger.info("TRAINING COMPLETE")
-    logger.info("="*70)
+    logger.info("=" * 70)
     logger.info(f"Total time: {total_time/60:.1f} minutes")
     logger.info(f"Final average loss: {all_metrics[-1].get('avg_loss', 0):.4f}")
     
@@ -1076,32 +1150,34 @@ def train(config: TreeRLConfig):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="TreeRL GRPO Training")
+    parser = argparse.ArgumentParser(description="TreeRL GRPO Training (Fixed for Unsloth)")
     
     # Model args
     parser.add_argument("--base-model", type=str, 
                        default="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
                        help="Base model name or path")
-    parser.add_argument("--sft-adapter", type=str,
+    parser.add_argument("--sft-adapter", type=str, 
                        default="orlandowhite/nemotron3_nano_sft",
-                       help="SFT LoRA adapter to continue from")
-    parser.add_argument("--max-seq-length", type=int, default=131072,
-                       help="Maximum sequence length (default 128k)")
-    parser.add_argument("--no-fp8", action="store_true",
-                       help="Disable FP8 (use BF16)")
-    parser.add_argument("--fast-inference", action="store_true",
-                       help="Enable Unsloth fast_inference (vLLM) for rollout generation")
+                       help="SFT LoRA adapter to continue training from (HF Hub or local path)")
+    parser.add_argument("--no-sft-adapter", action="store_true",
+                       help="Train fresh LoRA from base model (don't load SFT adapter)")
+    parser.add_argument("--max-seq-length", type=int, default=8192,
+                       help="Maximum sequence length")
+    parser.add_argument("--no-4bit", action="store_true",
+                       help="Disable 4-bit quantization (use BF16)")
     parser.add_argument("--rollout-max-new-tokens", type=int, default=2048,
-                       help="Max new tokens per local generation call during rollout")
-    parser.add_argument("--path-workers", type=int, default=1,
-                       help="Classification path worker threads (set >1 only if using vLLM batching)")
-    parser.add_argument("--calibrate-workers", type=int, default=1,
-                       help="Calibration worker threads (set >1 only if using vLLM batching)")
+                       help="Max new tokens per generation call during rollout")
+    
+    # LoRA args
+    parser.add_argument("--lora-rank", type=int, default=16,
+                       help="LoRA rank")
+    parser.add_argument("--lora-alpha", type=int, default=32,
+                       help="LoRA alpha")
     
     # Training args
-    parser.add_argument("--lr", type=float, default=1e-5,
+    parser.add_argument("--lr", type=float, default=5e-5,
                        help="Learning rate")
-    parser.add_argument("--grad-accum", type=int, default=8,
+    parser.add_argument("--grad-accum", type=int, default=4,
                        help="Gradient accumulation steps")
     parser.add_argument("--epochs", type=int, default=3,
                        help="Number of epochs")
@@ -1109,16 +1185,16 @@ def main():
     # Data args
     parser.add_argument("--chapter", type=str, default="84",
                        help="HTS chapter to train on")
-    parser.add_argument("--num-rulings", type=int, default=50,
+    parser.add_argument("--num-rulings", type=int, default=20,
                        help="Number of rulings per epoch")
     parser.add_argument("--cross-rulings-file", type=str,
                        default="cross_rulings_dataset.json",
                        help="Path to cross rulings JSON")
     
     # TreeRL args
-    parser.add_argument("--beam-size", type=int, default=8,
+    parser.add_argument("--beam-size", type=int, default=4,
                        help="Beam size for rollouts")
-    parser.add_argument("--max-questions", type=int, default=5,
+    parser.add_argument("--max-questions", type=int, default=3,
                        help="Max Q&A turns per rollout")
     
     # Output args
@@ -1127,24 +1203,18 @@ def main():
     
     args = parser.parse_args()
     
+    # Handle SFT adapter logic
+    sft_adapter = args.sft_adapter if not args.no_sft_adapter else ""
+    
     # Build config
-    # vLLM standby must be set BEFORE any Unsloth import.
-    if args.fast_inference:
-        os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
-
-    # Concurrency controls for local generation
-    os.environ["PATH_WORKERS"] = str(args.path_workers)
-    os.environ["CALIBRATE_WORKERS"] = str(args.calibrate_workers)
-
     config = TreeRLConfig(
         base_model=args.base_model,
-        sft_adapter=args.sft_adapter,
+        sft_adapter=sft_adapter,
         max_seq_length=args.max_seq_length,
-        load_in_fp8=not args.no_fp8,
-        use_fast_inference=args.fast_inference,
+        load_in_4bit=not args.no_4bit,
         rollout_max_new_tokens=args.rollout_max_new_tokens,
-        path_workers=args.path_workers,
-        calibrate_workers=args.calibrate_workers,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
         learning_rate=args.lr,
         gradient_accumulation_steps=args.grad_accum,
         num_epochs=args.epochs,
@@ -1161,4 +1231,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
