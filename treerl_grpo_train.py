@@ -21,11 +21,16 @@ Usage:
 import os
 import sys
 import json
+import gc
 import math
 import logging
 import argparse
 import random
 import time
+import shutil
+import signal
+import subprocess
+import requests
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -52,6 +57,7 @@ class TreeRLConfig:
     # Model settings
     base_model: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
     sft_adapter: str = "orlandowhite/nemotron3_nano_sft"  # Continue from your SFT adapter
+    merged_model_path: str = "./nemotron-merged"  # Pre-merged model for fast loading
     max_seq_length: int = 128000  
     load_in_4bit: bool = True  # Use 4-bit quantization (recommended for memory)
     offload_embedding: bool = False  # Disabled: causes device mismatch errors during generation
@@ -92,6 +98,10 @@ class TreeRLConfig:
     log_every_n_steps: int = 1
     save_every_n_epochs: int = 1
     
+    # vLLM settings
+    vllm_port: int = 8000
+    vllm_max_model_len: int = 128000  # Full context length
+    
     # Device
     device: str = "cuda"
 
@@ -127,85 +137,119 @@ def setup_logging(config: TreeRLConfig) -> logging.Logger:
 
 
 # ============================================================================
-# MODEL LOADING (Simplified for Unsloth)
+# MODEL LOADING (Merged Model + Fresh LoRA for Training)
 # ============================================================================
+
+def merge_adapter_to_base(
+    base_model_name: str,
+    adapter_name: str,
+    output_path: str,
+    logger: logging.Logger
+) -> None:
+    """
+    Merge a LoRA adapter into the base model and save.
+    This is done once to create a fast-loading merged model.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+    
+    logger.info("=" * 60)
+    logger.info("MERGING ADAPTER INTO BASE MODEL")
+    logger.info("=" * 60)
+    
+    total_start = time.time()
+    
+    # Load tokenizer
+    logger.info("[1/5] Loading tokenizer...")
+    t0 = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
+    logger.info(f"       Done in {time.time() - t0:.2f}s")
+    
+    # Load base model
+    logger.info("[2/5] Loading base model...")
+    t0 = time.time()
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    logger.info(f"       Done in {time.time() - t0:.2f}s")
+    
+    # Load LoRA adapter
+    logger.info("[3/5] Loading LoRA adapter...")
+    t0 = time.time()
+    model = PeftModel.from_pretrained(base_model, adapter_name)
+    logger.info(f"       Done in {time.time() - t0:.2f}s")
+    
+    # Merge weights
+    logger.info("[4/5] Merging LoRA weights into base model...")
+    t0 = time.time()
+    merged_model = model.merge_and_unload()
+    logger.info(f"       Done in {time.time() - t0:.2f}s")
+    
+    # Save merged model
+    logger.info(f"[5/5] Saving merged model to {output_path}...")
+    t0 = time.time()
+    os.makedirs(output_path, exist_ok=True)
+    merged_model.save_pretrained(output_path)
+    tokenizer.save_pretrained(output_path)
+    logger.info(f"       Done in {time.time() - t0:.2f}s")
+    
+    total_time = time.time() - total_start
+    logger.info("=" * 60)
+    logger.info(f"✓ Merge complete! Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
+    logger.info(f"✓ Merged model saved to: {output_path}")
+    logger.info("=" * 60)
+    
+    # Free memory
+    del merged_model, model, base_model
+    gc.collect()
+    torch.cuda.empty_cache()
+
 
 def load_model_and_tokenizer(config: TreeRLConfig, logger: logging.Logger):
     """
-    Load model with Unsloth using 4-bit quantization.
+    Load merged model with fresh LoRA for training.
     
-    This is the CORRECT way to load for a custom training loop:
-    1. Load base model with FastLanguageModel.from_pretrained
-    2. Add LoRA adapters with FastLanguageModel.get_peft_model
-    3. Optionally load weights from existing adapter
+    Assumes merged model already exists at merged_model_path.
+    Adds FRESH LoRA adapters for continued training.
     
     Returns:
-        model: The model with LoRA adapters ready for training
+        model: The merged model with fresh LoRA adapters for training
         tokenizer: The tokenizer
     """
-    logger.info("=" * 70)
-    logger.info("LOADING MODEL WITH UNSLOTH")
-    logger.info("=" * 70)
-    logger.info(f"Base model: {config.base_model}")
-    logger.info(f"SFT adapter: {config.sft_adapter}")
-    logger.info(f"4-bit quantization: {config.load_in_4bit}")
-    logger.info(f"Max sequence length: {config.max_seq_length}")
+    logger.info(f"Loading merged model: {config.merged_model_path}")
+    logger.info(f"  4-bit quantization: {config.load_in_4bit}")
+    logger.info(f"  Max sequence length: {config.max_seq_length}")
     
+    # Load the merged model with Unsloth
     try:
         from unsloth import FastLanguageModel
         
-        if config.sft_adapter:
-            # OPTION 1: Load existing adapter directly
-            # This is the CORRECT way to continue training an existing LoRA
-            logger.info(f"Loading model with existing SFT adapter: {config.sft_adapter}")
-            
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=config.sft_adapter,  # Load adapter directly!
-                max_seq_length=config.max_seq_length,
-                load_in_4bit=config.load_in_4bit,
-                offload_embedding=config.offload_embedding,
-                trust_remote_code=True,
-            )
-            logger.info("Model + SFT adapter loaded successfully")
-            
-            # The adapter is already attached - just make sure it's trainable
-            # Unsloth should have set this up, but let's verify
-            for name, param in model.named_parameters():
-                if "lora" in name.lower():
-                    param.requires_grad = True
-            
-            # Get the LoRA rank from loaded adapter for logging
-            loaded_rank = "unknown"
-            for name, param in model.named_parameters():
-                if "lora_A" in name:
-                    loaded_rank = param.shape[0]
-                    break
-            logger.info(f"Loaded adapter LoRA rank: {loaded_rank}")
-            
-        else:
-            # OPTION 2: Fresh LoRA from base model
-            logger.info("Loading base model and creating fresh LoRA adapters")
-            
-            model, tokenizer = FastLanguageModel.from_pretrained(
-                model_name=config.base_model,
-                max_seq_length=config.max_seq_length,
-                load_in_4bit=config.load_in_4bit,
-                offload_embedding=config.offload_embedding,
-                trust_remote_code=True,
-            )
-            logger.info("Base model loaded successfully")
-            
-            model = FastLanguageModel.get_peft_model(
-                model,
-                r=config.lora_rank,
-                target_modules=list(config.lora_target_modules),
-                lora_alpha=config.lora_alpha,
-                lora_dropout=0.0,
-                bias="none",
-                use_gradient_checkpointing="unsloth",
-                random_state=3407,
-            )
-            logger.info(f"Fresh LoRA adapters added (rank={config.lora_rank}, alpha={config.lora_alpha})")
+        t0 = time.time()
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=config.merged_model_path,
+            max_seq_length=config.max_seq_length,
+            load_in_4bit=config.load_in_4bit,
+            offload_embedding=config.offload_embedding,
+            trust_remote_code=True,
+        )
+        logger.info(f"Merged model loaded in {time.time() - t0:.2f}s")
+        
+        # Add FRESH LoRA adapters for training
+        logger.info(f"Adding fresh LoRA adapters (rank={config.lora_rank}, alpha={config.lora_alpha})...")
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=config.lora_rank,
+            target_modules=list(config.lora_target_modules),
+            lora_alpha=config.lora_alpha,
+            lora_dropout=0.0,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=3407,
+        )
+        logger.info("Fresh LoRA adapters added successfully")
         
         USING_UNSLOTH = True
         
@@ -218,18 +262,18 @@ def load_model_and_tokenizer(config: TreeRLConfig, logger: logging.Logger):
         
         # Standard loading without Unsloth
         model = AutoModelForCausalLM.from_pretrained(
-            config.base_model,
+            config.merged_model_path,
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
         )
         
         tokenizer = AutoTokenizer.from_pretrained(
-            config.base_model,
+            config.merged_model_path,
             trust_remote_code=True,
         )
         
-        # Add LoRA
+        # Add fresh LoRA
         lora_config = LoraConfig(
             r=config.lora_rank,
             lora_alpha=config.lora_alpha,
@@ -239,14 +283,7 @@ def load_model_and_tokenizer(config: TreeRLConfig, logger: logging.Logger):
         )
         model = get_peft_model(model, lora_config)
         
-        if config.sft_adapter:
-            try:
-                model.load_adapter(config.sft_adapter, adapter_name="sft")
-                model.set_adapter("sft")
-            except Exception as e:
-                logger.warning(f"Could not load adapter: {e}")
-        
-        logger.info("Model loaded with standard transformers")
+        logger.info("Model loaded with standard transformers + fresh LoRA")
     
     # Ensure padding token exists
     if tokenizer.pad_token is None:
@@ -263,237 +300,148 @@ def load_model_and_tokenizer(config: TreeRLConfig, logger: logging.Logger):
 
 
 # ============================================================================
-# LOCAL LLM CLIENT FOR ONLINE ROLLOUTS
+# VLLM SERVER MANAGEMENT FOR INFERENCE
 # ============================================================================
 
-class LocalLLMClient:
+class VLLMServerManager:
     """
-    Local LLM client for rollouts during training.
+    Manages a vLLM server for fast inference during rollouts.
     
-    Key differences from original:
-    1. NO FastLanguageModel.for_inference() calls - this breaks training
-    2. Simple model.eval() / model.train() switching
-    3. Standard HuggingFace generation
+    The vLLM server runs the merged model (no LoRA) for fast beam search.
+    Training uses Unsloth with LoRA separately.
     """
-
+    
     def __init__(
         self,
-        model,
-        tokenizer,
-        *,
-        device: str,
-        max_seq_length: int,
-        max_new_tokens: int,
-        temperature: float,
-        top_p: float,
-        logger: logging.Logger,
+        model_path: str,
+        port: int = 8000,
+        tensor_parallel_size: int = 1,
+        max_model_len: int = 8192,
+        logger: logging.Logger = None,
     ):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = device
-        self.max_seq_length = max_seq_length
-        self.max_new_tokens = max_new_tokens
-        self.temperature = temperature
-        self.top_p = top_p
-        self.logger = logger
+        self.model_path = model_path
+        self.port = port
+        self.tensor_parallel_size = tensor_parallel_size
+        self.max_model_len = max_model_len
+        self.logger = logger or logging.getLogger(__name__)
+        self.process: Optional[subprocess.Popen] = None
+        self.base_url = f"http://localhost:{port}"
+    
+    def start_async(self) -> bool:
+        """Start the vLLM server process without waiting for it to be ready."""
+        if self.process is not None:
+            self.logger.info(f"vLLM server already started on port {self.port}")
+            return True
         
-        # Try to load system prompt from your API
-        try:
-            from api.system_prompts_updated import UNIFIED_SYSTEM_PROMPT
-            self.system_prompt = UNIFIED_SYSTEM_PROMPT.strip()
-        except ImportError:
-            self.system_prompt = "You are a helpful assistant."
+        self.logger.info(f"Starting vLLM server with model: {self.model_path}")
+        self.logger.info(f"  Port: {self.port}")
+        self.logger.info(f"  Max model length: {self.max_model_len}")
         
-        self._system_prompt_injection: Optional[str] = None
-        
-        # Compatibility attributes expected by classification_engine.py
-        self.log_prompts = False  # Disable verbose prompt logging during training
-        self.prompt_logger = logger  # Use same logger if needed
-        
-        # JSON requirements for structured outputs
-        self._json_requirements = (
-            "CRITICAL JSON REQUIREMENTS:\n"
-            "- Return ONLY valid JSON with no additional text\n"
-            "- Do not include any explanation before or after the JSON\n"
-            "- If generating an array, ensure it starts with [ and ends with ]\n"
-            "- All JSON objects must be properly separated by commas within the array\n"
-            "- Do not generate separate JSON objects - they must be inside an array"
-        )
-
-    def set_system_prompt_injection(self, prompt: Optional[str]) -> None:
-        self._system_prompt_injection = prompt
-
-    def clear_system_prompt_injection(self) -> None:
-        self._system_prompt_injection = None
-
-    def _current_system_prompt(self) -> str:
-        return (self._system_prompt_injection or self.system_prompt).strip()
-
-    def _extract_json_from_response(self, response_text: str) -> str:
-        """Extract JSON from model response, handling code fences."""
-        if not response_text:
-            raise ValueError("No response text to parse.")
-
-        text = response_text.strip()
-
-        # Strip code fences
-        if text.startswith("```json"):
-            text = text[7:]
-        elif text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-
-        # Fast path: whole string is JSON
-        try:
-            json.loads(text)
-            return text
-        except Exception:
-            pass
-
-        # Try to locate array
-        start_a = text.find("[")
-        end_a = text.rfind("]")
-        if start_a != -1 and end_a != -1 and end_a > start_a:
-            candidate = text[start_a:end_a + 1]
-            try:
-                json.loads(candidate)
-                return candidate
-            except Exception:
-                pass
-
-        # Try to locate object
-        start_o = text.find("{")
-        end_o = text.rfind("}")
-        if start_o != -1 and end_o != -1 and end_o > start_o:
-            candidate = text[start_o:end_o + 1]
-            try:
-                json.loads(candidate)
-                return candidate
-            except Exception:
-                pass
-
-        raise ValueError(f"Failed to extract valid JSON from response: {response_text[:200]}...")
-
-    @torch.no_grad()
-    def _generate_from_messages(self, messages: List[Dict[str, str]], temperature: float) -> str:
-        """
-        Generate a response from a list of chat messages.
-        
-        IMPORTANT: We do NOT call FastLanguageModel.for_inference() here!
-        That method is for final inference only and breaks the training loop.
-        Instead, we just use model.eval() temporarily.
-        """
-        gen_start = time.time()
-        
-        # Apply chat template
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        
-        # Tokenize
-        inputs = self.tokenizer(
-            text,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_seq_length,
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        input_len = inputs["input_ids"].shape[1]
-        
-        self.logger.debug(f"    [LLM] Generating... input_tokens={input_len}")
-        
-        # Temporarily switch to eval mode
-        was_training = self.model.training
-        self.model.eval()
-        
-        try:
-            do_sample = float(temperature) > 0.0
-            
-            # Standard HuggingFace generation
-            gen = self.model.generate(
-                **inputs,
-                max_new_tokens=self.max_new_tokens,
-                do_sample=do_sample,
-                temperature=temperature if do_sample else None,
-                top_p=self.top_p if do_sample else None,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=True,
-            )
-        finally:
-            # Restore training mode if it was active
-            if was_training:
-                self.model.train()
-        
-        # Decode only the newly generated tokens
-        output_ids = gen[0][input_len:]
-        output_text = self.tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-        
-        gen_elapsed = time.time() - gen_start
-        num_tokens = len(output_ids)
-        tok_per_sec = num_tokens / gen_elapsed if gen_elapsed > 0 else 0
-        self.logger.debug(f"    [LLM] Generated {num_tokens} tokens in {gen_elapsed:.1f}s ({tok_per_sec:.1f} tok/s)")
-        
-        return output_text
-
-    def send_openai_request(
-        self,
-        prompt: str,
-        requires_json: bool = False,
-        temperature: float = 0.0,
-        **kwargs: Any,
-    ) -> str:
-        """Send a single-turn request."""
-        user_content = prompt.strip()
-        if requires_json:
-            user_content = f"{user_content.rstrip()}\n\n{self._json_requirements}"
-
-        messages = [
-            {"role": "system", "content": self._current_system_prompt()},
-            {"role": "user", "content": user_content},
+        # Use 'vllm serve' command (vLLM 0.12.0+) instead of the old entry point
+        # The old 'python -m vllm.entrypoints.openai.api_server' can cause
+        # 'AttributeError: module vllm has no attribute sampling_params'
+        cmd = [
+            "vllm", "serve", self.model_path,
+            "--host", "0.0.0.0",
+            "--port", str(self.port),
+            "--tensor-parallel-size", str(self.tensor_parallel_size),
+            "--max-model-len", str(self.max_model_len),
+            "--trust-remote-code",
+            "--dtype", "bfloat16",
+            "--async-scheduling",  # Recommended by NVIDIA for better performance
+            "--disable-log-requests",
         ]
+        
+        self.logger.info(f"  Command: {' '.join(cmd)}")
+        
+        # Start server in background
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,  # Create new process group for clean shutdown
+        )
+        self._start_time = time.time()
+        return True
+    
+    def wait_until_ready(self, timeout: int = 300) -> bool:
+        """Wait for the vLLM server to be ready."""
+        if self.process is None:
+            self.logger.error("vLLM server not started")
+            return False
+        
+        start_time = getattr(self, '_start_time', time.time())
+        self.logger.info(f"Waiting for vLLM server to be ready (timeout={timeout}s)...")
+        
+        while time.time() - start_time < timeout:
+            if self.is_running():
+                elapsed = time.time() - start_time
+                self.logger.info(f"✓ vLLM server ready in {elapsed:.1f}s")
+                return True
+            
+            # Check if process died
+            if self.process.poll() is not None:
+                self.logger.error("vLLM server process died during startup")
+                stdout, _ = self.process.communicate()
+                if stdout:
+                    self.logger.error(f"Server output: {stdout.decode()[-2000:]}")
+                return False
+            
+            time.sleep(5)
+        
+        self.logger.error(f"vLLM server failed to start within {timeout}s")
+        self.stop()
+        return False
+    
+    def start(self, wait_timeout: int = 300) -> bool:
+        """Start the vLLM server and wait for it to be ready."""
+        if self.is_running():
+            self.logger.info(f"vLLM server already running on port {self.port}")
+            return True
+        
+        self.start_async()
+        return self.wait_until_ready(timeout=wait_timeout)
+    
+    def is_running(self) -> bool:
+        """Check if the vLLM server is responding."""
+        try:
+            resp = requests.get(f"{self.base_url}/health", timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
+    
+    def stop(self):
+        """Stop the vLLM server."""
+        if self.process:
+            self.logger.info("Stopping vLLM server...")
+            try:
+                # Kill the entire process group
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                self.process.wait(timeout=10)
+            except Exception as e:
+                self.logger.warning(f"Error stopping vLLM server: {e}")
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+            self.process = None
+            self.logger.info("vLLM server stopped")
+    
+    def __enter__(self):
+        self.start()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+        return False
 
-        text = self._generate_from_messages(messages, temperature=temperature)
 
-        if requires_json:
-            cleaned = self._extract_json_from_response(text)
-            json.loads(cleaned)  # Validate
-            return cleaned
-        return text
-
-    def send_trajectory_request(
-        self,
-        messages: List[Dict[str, str]],
-        requires_json: bool = False,
-        temperature: float = 0.0,
-        **kwargs: Any,
-    ) -> str:
-        """Send a multi-turn request."""
-        req_messages = [m.copy() for m in messages]
-        if requires_json:
-            for i in range(len(req_messages) - 1, -1, -1):
-                if req_messages[i].get("role") == "user":
-                    req_messages[i]["content"] = f"{req_messages[i]['content'].rstrip()}\n\n{self._json_requirements}"
-                    break
-
-        text = self._generate_from_messages(req_messages, temperature=temperature)
-
-        if requires_json:
-            cleaned = self._extract_json_from_response(text)
-            json.loads(cleaned)  # Validate
-            return cleaned
-        return text
-
-    # Aliases for compatibility
-    def send_vertex_ai_request(self, *args, **kwargs) -> str:
-        return self.send_openai_request(*args, **kwargs)
-
-    def send_groq_request(self, prompt: str, requires_json: bool = False, temperature: float = 0.0) -> str:
-        return self.send_openai_request(prompt=prompt, requires_json=requires_json, temperature=temperature)
+def setup_vllm_environment(port: int = 8000):
+    """Set environment variables for the LLMClient to use our vLLM server."""
+    os.environ["CUSTOM_OPENAI_BASE_URL"] = f"http://localhost:{port}/v1"
+    os.environ["CUSTOM_OPENAI_API_KEY"] = "sk-local"
+    os.environ["CUSTOM_OPENAI_MODEL"] = "default"
+    os.environ["CUSTOM_OPENAI_TIMEOUT"] = "120"
 
 
 # ============================================================================
@@ -681,10 +629,11 @@ def run_online_rollout(
     ruling: Dict,
     config: TreeRLConfig,
     logger: logging.Logger,
-    local_llm: LocalLLMClient,
 ) -> List[Dict]:
     """
     Run beam search rollout for a single ruling and compute TreeRL rewards.
+    
+    Uses vLLM server (via LLMClient) for fast inference.
     
     Returns:
         List of training samples with messages and step_rewards
@@ -712,14 +661,8 @@ def run_online_rollout(
         logger.debug(f"  [rollout] Creating HTSTree...")
         hts_tree = HTSTree()
         
-        # Inject local LLM client
-        logger.debug(f"  [rollout] Injecting local LLM client...")
-        hts_tree.llm_client = local_llm
-        hts_tree.client = None
-        if hasattr(hts_tree, "classification_engine") and hasattr(hts_tree.classification_engine, "llm"):
-            hts_tree.classification_engine.llm = local_llm
-        if hasattr(hts_tree, "streaming_engine") and hasattr(hts_tree.streaming_engine, "llm_client"):
-            hts_tree.streaming_engine.llm_client = local_llm
+        # HTSTree uses LLMClient which connects to vLLM via CUSTOM_OPENAI_BASE_URL
+        logger.debug(f"  [rollout] Using vLLM via LLMClient...")
         
         # Load HTS data
         logger.debug(f"  [rollout] Loading HTS data...")
@@ -845,10 +788,12 @@ def train_epoch(
     config: TreeRLConfig,
     logger: logging.Logger,
     epoch: int,
-    local_llm: LocalLLMClient,
 ) -> Dict[str, float]:
     """
     Train for one epoch with online rollouts.
+    
+    Rollouts use vLLM (via LLMClient).
+    Training uses the Unsloth model with LoRA.
     """
     model.train()
     
@@ -876,8 +821,8 @@ def train_epoch(
         product_desc = ruling.get("short_product_description", "")[:50]
         logger.info(f"  Ruling {ruling_idx+1}/{len(epoch_rulings)}: {product_desc}...")
         
-        # Run online rollout
-        samples = run_online_rollout(ruling, config, logger, local_llm)
+        # Run online rollout using vLLM for inference
+        samples = run_online_rollout(ruling, config, logger)
         
         if not samples:
             logger.warning(f"  No samples from rollout, skipping")
@@ -987,7 +932,6 @@ def train_epoch(
         
         # Free memory periodically
         if (ruling_idx + 1) % 5 == 0:
-            import gc
             gc.collect()
             torch.cuda.empty_cache()
     
@@ -1008,8 +952,120 @@ def train_epoch(
 
 
 # ============================================================================
+# EPOCH-END MERGE LOGIC
+# ============================================================================
+
+def merge_lora_into_merged_model(
+    model,
+    tokenizer,
+    config: TreeRLConfig,
+    logger: logging.Logger,
+    epoch: int,
+) -> None:
+    """
+    Merge the current LoRA weights into the merged model.
+    
+    After training LoRA for an epoch, we merge those weights back into
+    the merged model so subsequent epochs and inference use the updated weights.
+    """
+    from peft import PeftModel
+    
+    logger.info("=" * 60)
+    logger.info(f"MERGING EPOCH {epoch+1} LORA INTO MERGED MODEL")
+    logger.info("=" * 60)
+    
+    t0 = time.time()
+    
+    # Save current LoRA adapter temporarily
+    temp_adapter_dir = os.path.join(config.output_dir, f"temp_adapter_epoch_{epoch+1}")
+    os.makedirs(temp_adapter_dir, exist_ok=True)
+    
+    logger.info(f"[1/4] Saving current LoRA adapter...")
+    model.save_pretrained(temp_adapter_dir)
+    logger.info(f"       Saved to {temp_adapter_dir}")
+    
+    # Free the current model from GPU memory
+    logger.info("[2/4] Freeing GPU memory...")
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # Load merged model in FP16/BF16 (not quantized) for merging
+    logger.info("[3/4] Loading merged model and new LoRA for merge...")
+    from transformers import AutoModelForCausalLM
+    
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.merged_model_path,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    
+    # Load the LoRA adapter
+    peft_model = PeftModel.from_pretrained(base_model, temp_adapter_dir)
+    
+    # Merge and unload
+    logger.info("[4/4] Merging LoRA weights and saving...")
+    merged = peft_model.merge_and_unload()
+    
+    # Save back to merged_model_path (overwrite)
+    merged.save_pretrained(config.merged_model_path)
+    tokenizer.save_pretrained(config.merged_model_path)
+    
+    merge_time = time.time() - t0
+    logger.info(f"✓ Merge complete in {merge_time:.2f}s")
+    logger.info(f"✓ Updated merged model at: {config.merged_model_path}")
+    
+    # Cleanup
+    del merged, peft_model, base_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # Clean up temp adapter
+    shutil.rmtree(temp_adapter_dir, ignore_errors=True)
+
+
+def reload_model_for_next_epoch(
+    config: TreeRLConfig,
+    logger: logging.Logger
+):
+    """
+    Reload the merged model with fresh LoRA for the next epoch.
+    Returns the new model and tokenizer.
+    
+    Note: vLLM server continues running - no need to restart it since
+    the merged model was already updated by merge_lora_into_merged_model.
+    We need to restart vLLM to pick up the new weights though.
+    """
+    logger.info("Reloading Unsloth model for next epoch...")
+    
+    model, tokenizer, using_unsloth = load_model_and_tokenizer(config, logger)
+    
+    return model, tokenizer, using_unsloth
+
+
+# ============================================================================
 # MAIN TRAINING FUNCTION
 # ============================================================================
+
+def ensure_merged_model_exists(config: TreeRLConfig, logger: logging.Logger) -> None:
+    """Ensure the merged model exists before starting vLLM."""
+    merged_config_path = os.path.join(config.merged_model_path, "config.json")
+    if not os.path.exists(merged_config_path):
+        if config.sft_adapter:
+            logger.info(f"Merged model not found at {config.merged_model_path}")
+            logger.info("Creating merged model from base + SFT adapter...")
+            merge_adapter_to_base(
+                config.base_model,
+                config.sft_adapter,
+                config.merged_model_path,
+                logger
+            )
+        else:
+            raise ValueError(f"No merged model at {config.merged_model_path} and no SFT adapter specified")
+    else:
+        logger.info(f"✓ Found existing merged model at {config.merged_model_path}")
+
 
 def train(config: TreeRLConfig):
     """Main training function."""
@@ -1018,37 +1074,55 @@ def train(config: TreeRLConfig):
     logger = setup_logging(config)
     
     logger.info("=" * 70)
-    logger.info("TREERL GRPO TRAINING (FIXED FOR UNSLOTH)")
+    logger.info("TREERL GRPO TRAINING (vLLM + UNSLOTH)")
     logger.info("=" * 70)
     logger.info(f"Config: {config}")
     
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
     
-    # Load model and tokenizer
-    logger.info("Loading model and tokenizer...")
+    # Step 1: Ensure merged model exists (needed for vLLM)
+    ensure_merged_model_exists(config, logger)
+    
+    # Step 2: Start vLLM server FIRST (let it load in background)
+    logger.info("=" * 70)
+    logger.info("STARTING VLLM SERVER FOR INFERENCE")
+    logger.info("=" * 70)
+    
+    vllm_server = VLLMServerManager(
+        model_path=config.merged_model_path,
+        port=config.vllm_port,
+        max_model_len=config.vllm_max_model_len,
+        logger=logger,
+    )
+    
+    # Start vLLM but don't wait yet - let it load while we load Unsloth
+    vllm_server.start_async()
+    logger.info("vLLM server starting in background...")
+    
+    # Step 3: Load Unsloth model while vLLM is starting
+    logger.info("=" * 70)
+    logger.info("LOADING UNSLOTH MODEL FOR TRAINING (parallel with vLLM)")
+    logger.info("=" * 70)
     model, tokenizer, using_unsloth = load_model_and_tokenizer(config, logger)
     
     # Note: With Unsloth, model is already on the correct device
-    # Only move if not using Unsloth
     if not using_unsloth:
         logger.info(f"Moving model to {config.device}...")
         model.to(config.device)
-    logger.info("Model ready")
+    logger.info("Unsloth model ready for training")
     
-    # Create local LLM client for rollouts
-    logger.info("Creating LocalLLMClient for rollouts...")
-    local_llm = LocalLLMClient(
-        model=model,
-        tokenizer=tokenizer,
-        device=config.device,
-        max_seq_length=config.max_seq_length,
-        max_new_tokens=config.rollout_max_new_tokens,
-        temperature=config.rollout_temperature,
-        top_p=config.rollout_top_p,
-        logger=logger,
-    )
-    logger.info("LocalLLMClient ready")
+    # Step 4: Now wait for vLLM to be ready
+    logger.info("Waiting for vLLM server to be ready...")
+    if not vllm_server.wait_until_ready(timeout=300):
+        logger.error("Failed to start vLLM server. Exiting.")
+        vllm_server.stop()
+        return
+    
+    # Configure LLMClient to use our vLLM server
+    setup_vllm_environment(port=config.vllm_port)
+    logger.info(f"✓ vLLM server running at http://localhost:{config.vllm_port}")
+    logger.info(f"  LLMClient will use: {os.environ.get('CUSTOM_OPENAI_BASE_URL')}")
     
     # Load data
     rulings = load_chapter_rulings(config, logger)
@@ -1091,10 +1165,10 @@ def train(config: TreeRLConfig):
         logger.info(f"EPOCH {epoch + 1}/{config.num_epochs}")
         logger.info(f"{'=' * 70}")
         
-        # Train epoch
+        # Train epoch (rollouts use vLLM, training uses Unsloth)
         epoch_metrics = train_epoch(
             model, tokenizer, optimizer,
-            rulings, config, logger, epoch, local_llm
+            rulings, config, logger, epoch
         )
         
         epoch_time = time.time() - epoch_start
@@ -1109,7 +1183,7 @@ def train(config: TreeRLConfig):
         logger.info(f"  Average reward: {epoch_metrics.get('avg_reward', 0):.4f}")
         logger.info(f"  Time: {epoch_time:.1f}s")
         
-        # Save checkpoint
+        # Save checkpoint (LoRA adapter)
         if (epoch + 1) % config.save_every_n_epochs == 0:
             checkpoint_dir = os.path.join(
                 config.output_dir, 
@@ -1121,8 +1195,42 @@ def train(config: TreeRLConfig):
             tokenizer.save_pretrained(checkpoint_dir)
             
             logger.info(f"  Checkpoint saved: {checkpoint_dir}")
+        
+        # Merge LoRA into merged model and reload for next epoch
+        # (Skip for the last epoch - we'll do final merge at the end)
+        if epoch < config.num_epochs - 1:
+            logger.info(f"\n  Merging epoch {epoch + 1} LoRA into merged model...")
+            
+            # Stop vLLM before merging (we'll restart with updated weights)
+            logger.info("  Stopping vLLM server for merge...")
+            vllm_server.stop()
+            
+            # Merge current LoRA into the merged model
+            merge_lora_into_merged_model(
+                model, tokenizer, config, logger, epoch
+            )
+            
+            # Reload Unsloth model with fresh LoRA for next epoch
+            model, tokenizer, using_unsloth = reload_model_for_next_epoch(
+                config, logger
+            )
+            
+            # Restart vLLM with the updated merged model
+            logger.info("  Restarting vLLM server with updated weights...")
+            if not vllm_server.start(wait_timeout=300):
+                logger.error("Failed to restart vLLM server. Exiting.")
+                return
+            
+            # Recreate optimizer for the new model's LoRA parameters
+            trainable_params = [p for p in model.parameters() if p.requires_grad]
+            optimizer = AdamW(
+                trainable_params,
+                lr=config.learning_rate,
+                weight_decay=config.weight_decay,
+            )
+            logger.info(f"  ✓ Ready for epoch {epoch + 2}")
     
-    # Training complete
+    # Training complete - cleanup
     total_time = time.time() - training_start
     
     logger.info("\n" + "=" * 70)
@@ -1131,12 +1239,23 @@ def train(config: TreeRLConfig):
     logger.info(f"Total time: {total_time/60:.1f} minutes")
     logger.info(f"Final average loss: {all_metrics[-1].get('avg_loss', 0):.4f}")
     
-    # Save final model
-    final_dir = os.path.join(config.output_dir, "final")
-    os.makedirs(final_dir, exist_ok=True)
-    model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-    logger.info(f"Final model saved: {final_dir}")
+    # Stop vLLM server
+    logger.info("\nStopping vLLM server...")
+    vllm_server.stop()
+    
+    # Save final LoRA adapter
+    final_lora_dir = os.path.join(config.output_dir, "final_lora")
+    os.makedirs(final_lora_dir, exist_ok=True)
+    model.save_pretrained(final_lora_dir)
+    tokenizer.save_pretrained(final_lora_dir)
+    logger.info(f"Final LoRA adapter saved: {final_lora_dir}")
+    
+    # Merge final LoRA into the merged model
+    logger.info("\nMerging final LoRA into merged model...")
+    merge_lora_into_merged_model(
+        model, tokenizer, config, logger, config.num_epochs - 1
+    )
+    logger.info(f"✓ Final merged model at: {config.merged_model_path}")
     
     # Save training metrics
     metrics_file = os.path.join(config.output_dir, "training_metrics.json")
@@ -1158,9 +1277,12 @@ def main():
                        help="Base model name or path")
     parser.add_argument("--sft-adapter", type=str, 
                        default="orlandowhite/nemotron3_nano_sft",
-                       help="SFT LoRA adapter to continue training from (HF Hub or local path)")
+                       help="SFT LoRA adapter to merge into base (HF Hub or local path)")
     parser.add_argument("--no-sft-adapter", action="store_true",
-                       help="Train fresh LoRA from base model (don't load SFT adapter)")
+                       help="Train fresh LoRA from base model (don't merge SFT adapter)")
+    parser.add_argument("--merged-model-path", type=str,
+                       default="./nemotron-merged",
+                       help="Path to pre-merged model (will create if doesn't exist)")
     parser.add_argument("--max-seq-length", type=int, default=8192,
                        help="Maximum sequence length")
     parser.add_argument("--no-4bit", action="store_true",
@@ -1201,6 +1323,10 @@ def main():
     parser.add_argument("--output-dir", type=str, default="treerl_checkpoints",
                        help="Output directory for checkpoints")
     
+    # vLLM args
+    parser.add_argument("--vllm-port", type=int, default=8000,
+                       help="Port for vLLM inference server")
+    
     args = parser.parse_args()
     
     # Handle SFT adapter logic
@@ -1210,6 +1336,7 @@ def main():
     config = TreeRLConfig(
         base_model=args.base_model,
         sft_adapter=sft_adapter,
+        merged_model_path=args.merged_model_path,
         max_seq_length=args.max_seq_length,
         load_in_4bit=not args.no_4bit,
         rollout_max_new_tokens=args.rollout_max_new_tokens,
@@ -1224,6 +1351,7 @@ def main():
         beam_size=args.beam_size,
         max_questions=args.max_questions,
         output_dir=args.output_dir,
+        vllm_port=args.vllm_port,
     )
     
     train(config)
