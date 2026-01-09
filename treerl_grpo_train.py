@@ -78,8 +78,9 @@ class TreeRLConfig:
     # Model settings
     base_model: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
     sft_adapter: str = "orlandowhite/nemotron3_nano_sft"
-    max_seq_length: int = 80000  # For Unsloth model loading
-    train_max_seq_length: int = 80000  # Max tokens per training sample
+    max_seq_length: int = 55000  # For Unsloth model loading
+    # Training cap: keep trajectories under 32k to avoid OOM
+    train_max_seq_length: int = 32000  # Max tokens per training sample
     load_in_4bit: bool = True
     rollout_max_new_tokens: int = 2048
     rollout_temperature: float = 0.7
@@ -89,7 +90,7 @@ class TreeRLConfig:
     vllm_host: str = "127.0.0.1"
     vllm_port: int = 8000
     vllm_gpu_memory_utilization: float = 0.90
-    vllm_max_model_len: int = 80000
+    vllm_max_model_len: int = 55000
     # NOTE: vLLM LoRA disabled - Nemotron-H conv1d/Mamba layers unsupported until PR #30802 merges
     vllm_enable_lora: bool = False
     vllm_max_lora_rank: int = 64
@@ -108,16 +109,6 @@ class TreeRLConfig:
     warmup_steps: int = 10
     gradient_accumulation_steps: int = 4
     max_grad_norm: float = 1.0
-
-    # Advantage / reward normalization
-    # NOTE: This script historically used raw per-step rewards as token weights.
-    # For sparse rewards (many 0s, few 1s), this can lead to weak gradients.
-    # GDPO-style normalization improves signal quality by normalizing per "reward
-    # dimension" within each rollout group, then applying a batch-wise
-    # normalization for stability.
-    advantage_mode: str = "gdpo"  # {"raw", "grpo", "gdpo"}
-    gdpo_eps: float = 1e-6
-    gdpo_batch_norm: bool = True
     
     # TreeRL settings
     beam_size: int = 4
@@ -1292,190 +1283,6 @@ def compute_grpo_loss(
     return loss, metrics
 
 
-def _safe_mean_std(values: List[float], eps: float) -> Tuple[float, float]:
-    if not values:
-        return 0.0, 0.0
-    m = sum(values) / len(values)
-    var = sum((v - m) ** 2 for v in values) / max(len(values) - 1, 1)
-    std = math.sqrt(max(var, 0.0))
-    if std < eps:
-        std = 0.0
-    return m, std
-
-
-def _compute_group_ids_for_samples(samples: List[Dict]) -> List[str]:
-    """
-    Compute a group id per sample for group-wise normalization.
-
-    We group beam paths belonging to the same underlying ruling / prompt.
-    In this codebase, `gold_code` is the most stable key available on samples.
-    """
-    group_ids = []
-    for s in samples:
-        gid = s.get("group_id") or s.get("gold_code") or "unknown_group"
-        group_ids.append(str(gid))
-    return group_ids
-
-
-def _apply_grpo_group_normalization_inplace(
-    samples: List[Dict],
-    group_ids: List[str],
-    eps: float,
-    reward_key: str = "leaf_reward",
-) -> None:
-    """
-    GRPO-style group-relative normalization for a SINGLE scalar reward per sample.
-    Writes normalized scalar advantage to `sample["_advantage_scalar"]`.
-    """
-    # Build group -> indices
-    groups: Dict[str, List[int]] = {}
-    for idx, gid in enumerate(group_ids):
-        groups.setdefault(gid, []).append(idx)
-
-    for gid, idxs in groups.items():
-        rewards = []
-        for i in idxs:
-            r = samples[i].get(reward_key, samples[i].get("reward", 0.0))
-            try:
-                rewards.append(float(r))
-            except Exception:
-                rewards.append(0.0)
-
-        mean_r, std_r = _safe_mean_std(rewards, eps=eps)
-        for local_j, i in enumerate(idxs):
-            r = rewards[local_j]
-            if std_r > 0:
-                a = (r - mean_r) / (std_r + eps)
-            else:
-                a = 0.0
-            samples[i]["_advantage_scalar"] = float(a)
-
-
-def _apply_gdpo_normalization_inplace(
-    samples: List[Dict],
-    group_ids: List[str],
-    eps: float,
-    batch_norm: bool = True,
-) -> None:
-    """
-    GDPO-style advantage computation adapted to this script:
-
-    - Treat each TreeRL *step reward* R(step) as a separate "reward dimension".
-    - For each group (beam paths for the same ruling), normalize each step
-      reward independently (decoupled normalization).
-    - Sum normalized per-step advantages to get a scalar per-sample advantage.
-    - Optionally apply batch-wise normalization to keep a stable numerical scale.
-    - Distribute the final scalar advantage back to per-step advantages so the
-      existing per-token step-weighting continues to work.
-
-    Outputs:
-    - sample["_advantage_scalar"]: final scalar advantage after (optional) batch norm
-    - sample["_advantage_per_step"]: dict[int step -> float advantage contribution]
-    """
-    # Build group -> indices
-    groups: Dict[str, List[int]] = {}
-    for idx, gid in enumerate(group_ids):
-        groups.setdefault(gid, []).append(idx)
-
-    # First pass: per-group, per-step decoupled normalization
-    per_sample_step_a: List[Dict[int, float]] = [dict() for _ in samples]
-    per_sample_a_sum: List[float] = [0.0 for _ in samples]
-
-    for gid, idxs in groups.items():
-        # Collect all step indices present in this group
-        step_set = set()
-        for i in idxs:
-            for sr in samples[i].get("step_rewards", []) or []:
-                if "step" in sr:
-                    try:
-                        step_set.add(int(sr["step"]))
-                    except Exception:
-                        continue
-
-        if not step_set:
-            # No step rewards; leave at 0 (fallback handled downstream)
-            continue
-
-        steps = sorted(step_set)
-
-        # Build per-step list of rewards across group members
-        for step in steps:
-            r_vals = []
-            for i in idxs:
-                # Default missing step reward to 0
-                r_i = 0.0
-                for sr in samples[i].get("step_rewards", []) or []:
-                    try:
-                        if int(sr.get("step", -999999)) == step:
-                            r_i = float(sr.get("R", 0.0))
-                            break
-                    except Exception:
-                        continue
-                r_vals.append(r_i)
-
-            mean_r, std_r = _safe_mean_std(r_vals, eps=eps)
-            for local_j, i in enumerate(idxs):
-                r = r_vals[local_j]
-                if std_r > 0:
-                    a_step = (r - mean_r) / (std_r + eps)
-                else:
-                    a_step = 0.0
-                per_sample_step_a[i][step] = float(a_step)
-
-        # Sum per-step advantages per sample
-        for i in idxs:
-            a_sum = sum(per_sample_step_a[i].values()) if per_sample_step_a[i] else 0.0
-            per_sample_a_sum[i] = float(a_sum)
-
-    # Second pass: batch-wise normalization of the scalar summed advantages
-    if batch_norm:
-        mean_a, std_a = _safe_mean_std(per_sample_a_sum, eps=eps)
-        if std_a > 0:
-            a_hat = [float((a - mean_a) / (std_a + eps)) for a in per_sample_a_sum]
-        else:
-            a_hat = [0.0 for _ in per_sample_a_sum]
-    else:
-        a_hat = [float(a) for a in per_sample_a_sum]
-
-    # Third pass: distribute scalar advantage back to steps so token weights still work
-    for i in range(len(samples)):
-        samples[i]["_advantage_scalar"] = float(a_hat[i])
-
-        a_sum = per_sample_a_sum[i]
-        if not per_sample_step_a[i] or abs(a_sum) < eps:
-            samples[i]["_advantage_per_step"] = {}
-            continue
-
-        # Proportional distribution: ensures sum(step_contribs) == final scalar advantage
-        step_contribs = {}
-        for step, a_step in per_sample_step_a[i].items():
-            step_contribs[int(step)] = float(a_hat[i] * (a_step / (a_sum + eps)))
-        samples[i]["_advantage_per_step"] = step_contribs
-
-
-def _rewrite_sample_step_rewards_from_advantages_inplace(samples: List[Dict]) -> None:
-    """
-    If `_advantage_per_step` is present, rewrite each sample's `step_rewards[*].R`
-    to the normalized advantage contribution for that step.
-    """
-    for s in samples:
-        per_step = s.get("_advantage_per_step")
-        if not per_step:
-            continue
-        new_srs = []
-        for sr in s.get("step_rewards", []) or []:
-            step = sr.get("step")
-            try:
-                step_i = int(step)
-            except Exception:
-                new_srs.append(sr)
-                continue
-            sr2 = dict(sr)
-            sr2["R"] = float(per_step.get(step_i, 0.0))
-            new_srs.append(sr2)
-        s["step_rewards"] = new_srs
-
-
 def train_on_samples(
     samples: List[Dict],
     config: TreeRLConfig,
@@ -1493,7 +1300,6 @@ def train_on_samples(
     logger.info(f"Training on {len(samples)} samples...")
     logger.info(f"  Train max seq length: {config.train_max_seq_length}")
     logger.info(f"  Gradient accumulation: {config.gradient_accumulation_steps}")
-    logger.info(f"  Advantage mode: {config.advantage_mode}")
     
     # Load training model
     model, tokenizer = load_training_model(config, logger, adapter_path)
@@ -1513,44 +1319,6 @@ def train_on_samples(
         "num_samples": 0,
         "skipped_too_long": 0,
     }
-
-    # ---------------------------------------------------------
-    # Advantage normalization (GRPO / GDPO-style)
-    # ---------------------------------------------------------
-    # This is done once up front so per-sample training can remain sequential.
-    try:
-        group_ids = _compute_group_ids_for_samples(samples)
-        if config.advantage_mode == "gdpo":
-            _apply_gdpo_normalization_inplace(
-                samples,
-                group_ids=group_ids,
-                eps=config.gdpo_eps,
-                batch_norm=config.gdpo_batch_norm,
-            )
-            _rewrite_sample_step_rewards_from_advantages_inplace(samples)
-        elif config.advantage_mode == "grpo":
-            _apply_grpo_group_normalization_inplace(
-                samples,
-                group_ids=group_ids,
-                eps=config.gdpo_eps,
-                reward_key="leaf_reward",
-            )
-            # In GRPO mode, scale all step rewards by the sample scalar advantage.
-            # This preserves the existing per-step structure while injecting
-            # group-relative normalization.
-            for s in samples:
-                a = float(s.get("_advantage_scalar", 0.0))
-                if not s.get("step_rewards"):
-                    continue
-                s["step_rewards"] = [
-                    {**sr, "R": float(sr.get("R", 0.0)) * a}
-                    for sr in (s.get("step_rewards") or [])
-                ]
-        else:
-            # raw mode: keep current behavior
-            pass
-    except Exception as e:
-        logger.warning(f"Advantage normalization skipped due to error: {e}")
     
     accumulated_loss = 0.0
     accumulated_steps = 0
@@ -1564,30 +1332,150 @@ def train_on_samples(
         if not messages:
             continue
         
-        try:
-            text = tokenizer.apply_chat_template(
-                messages,
+        def _try_tokenize(msgs: List[Dict[str, str]]):
+            text_local = tokenizer.apply_chat_template(
+                msgs,
                 tokenize=False,
-                add_generation_prompt=False
+                add_generation_prompt=False,
             )
-            
-            inputs = tokenizer(
-                text,
+            inputs_local = tokenizer(
+                text_local,
                 return_tensors="pt",
                 truncation=True,
-                max_length=config.train_max_seq_length,  # Use training-specific limit
+                max_length=config.train_max_seq_length,
                 padding=False,
             )
-            
+            return text_local, inputs_local
+
+        def _slim_messages_for_training(msgs: List[Dict[str, str]]) -> List[Dict[str, str]]:
+            """
+            Reduce token count while preserving:
+            - path_so_far in rank_candidates user messages (needed for step mapping)
+            - primary_selection option_index/code in assistant messages
+            - enough structure to keep the model conditioned.
+
+            Strategy:
+            - For assistant JSON, drop large reasoning fields ('thinking', 'detailed_internal_reasoning')
+            - For user JSON INPUT blocks, keep only a minimal subset and shrink large arrays / long strings
+            - For chapter notes blocks, remove the notes payload
+            """
+            import re
+            import json as _json
+
+            def _truncate(s: str, n: int) -> str:
+                s = s or ""
+                return s if len(s) <= n else (s[:n] + "…")
+
+            slimmed: List[Dict[str, str]] = []
+            for m in msgs:
+                role = m.get("role", "")
+                content = m.get("content", "") or ""
+
+                if role == "assistant":
+                    # Strip huge reasoning fields to reduce context
+                    try:
+                        data = _json.loads(content)
+                        if isinstance(data, dict):
+                            data.pop("thinking", None)
+                            data.pop("detailed_internal_reasoning", None)
+                            # Also truncate nested reasoning strings
+                            for k in ("primary_selection", "alternative_1", "alternative_2"):
+                                if isinstance(data.get(k), dict) and "reasoning" in data[k]:
+                                    data[k]["reasoning"] = _truncate(str(data[k]["reasoning"]), 160)
+                            content = _json.dumps(data, ensure_ascii=False)
+                    except Exception:
+                        pass
+                    slimmed.append({"role": role, "content": content})
+                    continue
+
+                if role == "user":
+                    # Remove giant chapter notes payloads (stage2)
+                    if "RELEVANT NOTES" in content and "TASK: select_chapters_stage2" in content:
+                        # Keep header + JSON INPUT only
+                        json_idx = content.find("JSON INPUT:")
+                        kept = content[: json_idx + len("JSON INPUT:")] if json_idx != -1 else "TASK: select_chapters_stage2"
+                        # Keep the JSON input itself if present
+                        json_blob = content[json_idx + len("JSON INPUT:") :] if json_idx != -1 else ""
+                        content = kept + "\n{ \"notes_omitted\": true }\n" + _truncate(json_blob.strip(), 1200)
+                        slimmed.append({"role": role, "content": content})
+                        continue
+
+                    # Try to shrink JSON INPUT payloads
+                    if "JSON INPUT:" in content:
+                        head, _, tail = content.partition("JSON INPUT:")
+                        # Tail should start with JSON; try to parse the first JSON object in tail.
+                        json_start = tail.find("{")
+                        if json_start != -1:
+                            raw = tail[json_start:]
+                            try:
+                                data = _json.loads(raw)
+                                if isinstance(data, dict) and "data" in data:
+                                    task = data.get("task", "")
+                                    d = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+                                    out = {"task": task, "data": {}}
+                                    # Keep conditioning essentials
+                                    if "product_text" in d:
+                                        out["data"]["product_text"] = _truncate(str(d.get("product_text")), 500)
+                                    if "path_so_far" in d:
+                                        # MUST keep this for step mapping
+                                        out["data"]["path_so_far"] = str(d.get("path_so_far"))
+                                    if "select_count" in d:
+                                        out["data"]["select_count"] = d.get("select_count")
+                                    # Shrink candidate lists aggressively
+                                    tree = d.get("classification_tree")
+                                    if isinstance(tree, dict) and isinstance(tree.get("children"), list):
+                                        children = tree["children"]
+                                        # Keep only small fields; cap list length
+                                        slim_children = []
+                                        for c in children[:12]:
+                                            if not isinstance(c, dict):
+                                                continue
+                                            slim_children.append({
+                                                "index": c.get("index"),
+                                                "code": c.get("code"),
+                                                "is_group": c.get("is_group"),
+                                                "node_id": c.get("node_id"),
+                                                "description": _truncate(str(c.get("description", "")), 60),
+                                            })
+                                        out["data"]["classification_tree"] = {"children": slim_children, "children_truncated": len(children) > len(slim_children)}
+                                    content = head + "JSON INPUT:\n" + _json.dumps(out, ensure_ascii=False)
+                            except Exception:
+                                pass
+
+                    # Generic trimming for very long user messages
+                    if len(content) > 6000:
+                        content = _truncate(content, 6000)
+                    slimmed.append({"role": role, "content": content})
+                    continue
+
+                # System or other: keep but trim huge blocks
+                if len(content) > 6000:
+                    content = content[:6000] + "…"
+                slimmed.append({"role": role, "content": content})
+
+            return slimmed
+
+        try:
+            _, inputs = _try_tokenize(messages)
             input_ids = inputs["input_ids"].to(config.device)
             attention_mask = inputs["attention_mask"].to(config.device)
-            
             seq_len = input_ids.shape[1]
-            
-            # Skip if truncated too much (lost important content)
+
+            # If too long, slim messages and retry tokenization
+            if seq_len > config.train_max_seq_length:
+                logger.warning(f"  Sample {sample_idx}: {seq_len} tokens > {config.train_max_seq_length} — slimming trajectory...")
+                slimmed_messages = _slim_messages_for_training(messages)
+                _, inputs2 = _try_tokenize(slimmed_messages)
+                input_ids = inputs2["input_ids"].to(config.device)
+                attention_mask = inputs2["attention_mask"].to(config.device)
+                seq_len2 = input_ids.shape[1]
+                logger.warning(f"  Sample {sample_idx}: after slimming → {seq_len2} tokens")
+                messages = slimmed_messages
+                seq_len = seq_len2
+
             if seq_len >= config.train_max_seq_length:
                 logger.debug(f"  Sample {sample_idx}: truncated to {seq_len} tokens")
-            
+
         except Exception as e:
             logger.warning(f"Tokenization error: {e}")
             continue
@@ -1973,9 +1861,9 @@ def main():
                        help="SFT LoRA adapter to continue training from")
     parser.add_argument("--no-sft-adapter", action="store_true",
                        help="Train fresh LoRA from base model")
-    parser.add_argument("--max-seq-length", type=int, default=80000,
+    parser.add_argument("--max-seq-length", type=int, default=55000,
                        help="Maximum sequence length for model loading")
-    parser.add_argument("--train-max-seq-length", type=int, default=80000,
+    parser.add_argument("--train-max-seq-length", type=int, default=32000,
                        help="Maximum sequence length per training sample")
     parser.add_argument("--no-4bit", action="store_true",
                        help="Disable 4-bit quantization")
@@ -1985,7 +1873,7 @@ def main():
     # vLLM args
     parser.add_argument("--vllm-port", type=int, default=8000,
                        help="vLLM server port")
-    parser.add_argument("--vllm-max-model-len", type=int, default=80000,
+    parser.add_argument("--vllm-max-model-len", type=int, default=55000,
                        help="vLLM max context length")
     parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
                        help="vLLM GPU memory utilization")
@@ -2003,26 +1891,6 @@ def main():
                        help="Gradient accumulation steps")
     parser.add_argument("--epochs", type=int, default=3,
                        help="Number of epochs")
-
-    # Advantage / reward normalization
-    parser.add_argument(
-        "--advantage-mode",
-        type=str,
-        default="gdpo",
-        choices=["raw", "grpo", "gdpo"],
-        help="How to compute/normalize advantages from rewards (default: gdpo)",
-    )
-    parser.add_argument(
-        "--gdpo-eps",
-        type=float,
-        default=1e-6,
-        help="Epsilon for GDPO/GRPO normalization stability",
-    )
-    parser.add_argument(
-        "--no-gdpo-batch-norm",
-        action="store_true",
-        help="Disable batch-wise advantage normalization in GDPO",
-    )
     
     # Data args
     parser.add_argument("--chapter", type=str, default="84",
@@ -2068,9 +1936,6 @@ def main():
         beam_size=args.beam_size,
         max_questions=args.max_questions,
         output_dir=args.output_dir,
-        advantage_mode=args.advantage_mode,
-        gdpo_eps=args.gdpo_eps,
-        gdpo_batch_norm=not args.no_gdpo_batch_norm,
     )
     
     train(config)

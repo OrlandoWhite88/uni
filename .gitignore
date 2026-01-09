@@ -26,3 +26,13 @@ token_env/
 # Checkpoints and caches
 treerl_checkpoints/
 vllm/
+unsloth_compiled_cache/
+
+# Test/temp directories
+treerl_test_run/
+
+# Temp scripts
+fix_ctrlc.sh
+
+# Modal local state
+.modal/
