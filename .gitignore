@@ -22,3 +22,7 @@ venv/
 new_venv/
 token_env/
 
+
+# Checkpoints and caches
+treerl_checkpoints/
+vllm/

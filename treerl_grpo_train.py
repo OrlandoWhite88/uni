@@ -1,36 +1,53 @@
 #!/usr/bin/env python3
 """
-TreeRL GRPO Training Script (Fixed for Unsloth)
+TreeRL GRPO Training Script with vLLM + Unsloth
 
-Custom GRPO training loop for TreeRL with:
-- 4-bit or BF16 precision via Unsloth (NO vLLM/fast_inference)
-- Online rollouts using standard HuggingFace generation
-- Proper LoRA adapter handling
-- Per-step R(s) weighting per TreeRL paper
+Architecture (Sequential GPU sharing - Batched RL):
 
-Key fixes from original:
-1. Removed FP8 and fast_inference (vLLM) - use 4-bit instead
-2. Removed FastLanguageModel.for_inference() calls during training
-3. Fixed model mode management for train/eval switching
-4. Simplified generation to work with Unsloth in training context
+Per-Epoch Flow:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  PHASE 1: Load vLLM with merged SFT/LoRA model                  │
+    │           (first epoch uses pre-merged SFT adapter)             │
+    └─────────────────────────────────────────────────────────────────┘
+                                    ↓
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  PHASE 2: Run beam search rollouts for ALL rulings in batch     │
+    │           Collect training samples from each ruling             │
+    └─────────────────────────────────────────────────────────────────┘
+                                    ↓
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  PHASE 3: Stop vLLM server, free GPU memory                     │
+    └─────────────────────────────────────────────────────────────────┘
+                                    ↓
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  PHASE 4: Load Unsloth, train LoRA on ALL collected samples     │
+    └─────────────────────────────────────────────────────────────────┘
+                                    ↓
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  PHASE 5: Export LoRA adapter + merge into base for next vLLM   │
+    │           Unload Unsloth, free GPU memory                       │
+    └─────────────────────────────────────────────────────────────────┘
+                                    ↓
+                            [Next Epoch]
+
+This ensures vLLM and Unsloth never compete for GPU memory.
 
 Usage:
-    python treerl_grpo_train_fixed.py --chapter 84 --num-rulings 50 --epochs 3
+    python treerl_grpo_train.py --chapter 84 --num-rulings 20 --epochs 3
 """
 
 import os
 import sys
 import json
-import gc
 import math
 import logging
 import argparse
 import random
 import time
-import shutil
-import signal
 import subprocess
+import signal
 import requests
+import gc
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -39,6 +56,10 @@ from datetime import datetime
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
+import threading
+
+# Enable expandable segments for better CUDA memory management with long contexts
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Add the api directory to path
 script_dir = Path(__file__).parent
@@ -56,18 +77,26 @@ class TreeRLConfig:
     
     # Model settings
     base_model: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-    sft_adapter: str = "orlandowhite/nemotron3_nano_sft"  # Continue from your SFT adapter
-    merged_model_path: str = "./nemotron-merged"  # Pre-merged model for fast loading
-    max_seq_length: int = 128000  
-    load_in_4bit: bool = True  # Use 4-bit quantization (recommended for memory)
-    offload_embedding: bool = False  # Disabled: causes device mismatch errors during generation
+    sft_adapter: str = "orlandowhite/nemotron3_nano_sft"
+    max_seq_length: int = 80000  # For Unsloth model loading
+    train_max_seq_length: int = 80000  # Max tokens per training sample
+    load_in_4bit: bool = True
     rollout_max_new_tokens: int = 2048
-    rollout_temperature: float = 0.7  # Small temp for diversity in rollouts
+    rollout_temperature: float = 0.7
     rollout_top_p: float = 0.95
     
-    # LoRA settings - MUST match your existing SFT adapter!
+    # vLLM settings
+    vllm_host: str = "127.0.0.1"
+    vllm_port: int = 8000
+    vllm_gpu_memory_utilization: float = 0.90
+    vllm_max_model_len: int = 80000
+    # NOTE: vLLM LoRA disabled - Nemotron-H conv1d/Mamba layers unsupported until PR #30802 merges
+    vllm_enable_lora: bool = False
+    vllm_max_lora_rank: int = 64
+    
+    # LoRA settings
     lora_rank: int = 16
-    lora_alpha: int = 32  # typically 2x rank
+    lora_alpha: int = 32
     lora_target_modules: Tuple[str, ...] = (
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -79,9 +108,19 @@ class TreeRLConfig:
     warmup_steps: int = 10
     gradient_accumulation_steps: int = 4
     max_grad_norm: float = 1.0
+
+    # Advantage / reward normalization
+    # NOTE: This script historically used raw per-step rewards as token weights.
+    # For sparse rewards (many 0s, few 1s), this can lead to weak gradients.
+    # GDPO-style normalization improves signal quality by normalizing per "reward
+    # dimension" within each rollout group, then applying a batch-wise
+    # normalization for stability.
+    advantage_mode: str = "gdpo"  # {"raw", "grpo", "gdpo"}
+    gdpo_eps: float = 1e-6
+    gdpo_batch_norm: bool = True
     
     # TreeRL settings
-    beam_size: int = 4  # Reduced for faster rollouts
+    beam_size: int = 4
     max_questions: int = 3
     
     # Data settings
@@ -93,14 +132,12 @@ class TreeRLConfig:
     cross_rulings_file: str = "cross_rulings_dataset.json"
     output_dir: str = "treerl_checkpoints"
     log_file: str = "treerl_training.log"
+    adapter_sync_dir: str = "treerl_checkpoints/adapter_sync"
+    samples_dir: str = "treerl_checkpoints/samples"  # Debug: save collected samples
     
     # Logging
     log_every_n_steps: int = 1
     save_every_n_epochs: int = 1
-    
-    # vLLM settings
-    vllm_port: int = 8000
-    vllm_max_model_len: int = 128000  # Full context length
     
     # Device
     device: str = "cuda"
@@ -115,14 +152,12 @@ def setup_logging(config: TreeRLConfig) -> logging.Logger:
     logger = logging.getLogger("treerl_train")
     logger.setLevel(logging.DEBUG)
     
-    # File handler
     file_handler = logging.FileHandler(config.log_file)
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s'
     ))
     
-    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter(
@@ -136,312 +171,462 @@ def setup_logging(config: TreeRLConfig) -> logging.Logger:
     return logger
 
 
-# ============================================================================
-# MODEL LOADING (Merged Model + Fresh LoRA for Training)
-# ============================================================================
-
-def merge_adapter_to_base(
-    base_model_name: str,
-    adapter_name: str,
-    output_path: str,
-    logger: logging.Logger
-) -> None:
-    """
-    Merge a LoRA adapter into the base model and save.
-    This is done once to create a fast-loading merged model.
-    """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from peft import PeftModel
-    
-    logger.info("=" * 60)
-    logger.info("MERGING ADAPTER INTO BASE MODEL")
-    logger.info("=" * 60)
-    
-    total_start = time.time()
-    
-    # Load tokenizer
-    logger.info("[1/5] Loading tokenizer...")
-    t0 = time.time()
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
-    logger.info(f"       Done in {time.time() - t0:.2f}s")
-    
-    # Load base model
-    logger.info("[2/5] Loading base model...")
-    t0 = time.time()
-    base_model = AutoModelForCausalLM.from_pretrained(
-        base_model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    logger.info(f"       Done in {time.time() - t0:.2f}s")
-    
-    # Load LoRA adapter
-    logger.info("[3/5] Loading LoRA adapter...")
-    t0 = time.time()
-    model = PeftModel.from_pretrained(base_model, adapter_name)
-    logger.info(f"       Done in {time.time() - t0:.2f}s")
-    
-    # Merge weights
-    logger.info("[4/5] Merging LoRA weights into base model...")
-    t0 = time.time()
-    merged_model = model.merge_and_unload()
-    logger.info(f"       Done in {time.time() - t0:.2f}s")
-    
-    # Save merged model
-    logger.info(f"[5/5] Saving merged model to {output_path}...")
-    t0 = time.time()
-    os.makedirs(output_path, exist_ok=True)
-    merged_model.save_pretrained(output_path)
-    tokenizer.save_pretrained(output_path)
-    logger.info(f"       Done in {time.time() - t0:.2f}s")
-    
-    total_time = time.time() - total_start
-    logger.info("=" * 60)
-    logger.info(f"✓ Merge complete! Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
-    logger.info(f"✓ Merged model saved to: {output_path}")
-    logger.info("=" * 60)
-    
-    # Free memory
-    del merged_model, model, base_model
+def free_gpu_memory():
+    """Aggressively free GPU memory."""
     gc.collect()
-    torch.cuda.empty_cache()
-
-
-def load_model_and_tokenizer(config: TreeRLConfig, logger: logging.Logger):
-    """
-    Load merged model with fresh LoRA for training.
-    
-    Assumes merged model already exists at merged_model_path.
-    Adds FRESH LoRA adapters for continued training.
-    
-    Returns:
-        model: The merged model with fresh LoRA adapters for training
-        tokenizer: The tokenizer
-    """
-    logger.info(f"Loading merged model: {config.merged_model_path}")
-    logger.info(f"  4-bit quantization: {config.load_in_4bit}")
-    logger.info(f"  Max sequence length: {config.max_seq_length}")
-    
-    # Load the merged model with Unsloth
-    try:
-        from unsloth import FastLanguageModel
-        
-        t0 = time.time()
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=config.merged_model_path,
-            max_seq_length=config.max_seq_length,
-            load_in_4bit=config.load_in_4bit,
-            offload_embedding=config.offload_embedding,
-            trust_remote_code=True,
-        )
-        logger.info(f"Merged model loaded in {time.time() - t0:.2f}s")
-        
-        # Add FRESH LoRA adapters for training
-        logger.info(f"Adding fresh LoRA adapters (rank={config.lora_rank}, alpha={config.lora_alpha})...")
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=config.lora_rank,
-            target_modules=list(config.lora_target_modules),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=0.0,
-            bias="none",
-            use_gradient_checkpointing="unsloth",
-            random_state=3407,
-        )
-        logger.info("Fresh LoRA adapters added successfully")
-        
-        USING_UNSLOTH = True
-        
-    except ImportError as e:
-        logger.warning(f"Unsloth not available ({e}), falling back to standard loading")
-        USING_UNSLOTH = False
-        
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import get_peft_model, LoraConfig
-        
-        # Standard loading without Unsloth
-        model = AutoModelForCausalLM.from_pretrained(
-            config.merged_model_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.merged_model_path,
-            trust_remote_code=True,
-        )
-        
-        # Add fresh LoRA
-        lora_config = LoraConfig(
-            r=config.lora_rank,
-            lora_alpha=config.lora_alpha,
-            target_modules=list(config.lora_target_modules),
-            lora_dropout=0.0,
-            bias="none",
-        )
-        model = get_peft_model(model, lora_config)
-        
-        logger.info("Model loaded with standard transformers + fresh LoRA")
-    
-    # Ensure padding token exists
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        logger.info(f"Set pad_token to eos_token: {tokenizer.pad_token}")
-    
-    # Log model stats
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
-    logger.info(f"Total parameters: {total_params:,}")
-    
-    return model, tokenizer, USING_UNSLOTH
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 # ============================================================================
-# VLLM SERVER MANAGEMENT FOR INFERENCE
+# VLLM SERVER MANAGEMENT
 # ============================================================================
 
 class VLLMServerManager:
-    """
-    Manages a vLLM server for fast inference during rollouts.
+    """Manages vLLM server lifecycle."""
     
-    The vLLM server runs the merged model (no LoRA) for fast beam search.
-    Training uses Unsloth with LoRA separately.
-    """
-    
-    def __init__(
-        self,
-        model_path: str,
-        port: int = 8000,
-        tensor_parallel_size: int = 1,
-        max_model_len: int = 8192,
-        logger: logging.Logger = None,
-    ):
-        self.model_path = model_path
-        self.port = port
-        self.tensor_parallel_size = tensor_parallel_size
-        self.max_model_len = max_model_len
-        self.logger = logger or logging.getLogger(__name__)
+    def __init__(self, config: TreeRLConfig, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
         self.process: Optional[subprocess.Popen] = None
-        self.base_url = f"http://localhost:{port}"
+        self.base_url = f"http://{config.vllm_host}:{config.vllm_port}"
+        self._current_model_path: Optional[str] = None
+        self._log_thread: Optional[threading.Thread] = None
+        self._stop_logging = threading.Event()
     
-    def start_async(self) -> bool:
-        """Start the vLLM server process without waiting for it to be ready."""
-        if self.process is not None:
-            self.logger.info(f"vLLM server already started on port {self.port}")
+    def start_server(self, model_path: Optional[str] = None) -> bool:
+        """Start vLLM server with specified model.
+        
+        Args:
+            model_path: Path to model to serve. If None, uses config.base_model.
+                       For Nemotron-H, pass a merged model path (LoRA unsupported).
+        """
+        if self.is_running():
+            self.logger.info("vLLM server already running")
             return True
         
-        self.logger.info(f"Starting vLLM server with model: {self.model_path}")
-        self.logger.info(f"  Port: {self.port}")
-        self.logger.info(f"  Max model length: {self.max_model_len}")
+        self.logger.info("Starting vLLM server...")
+        free_gpu_memory()
         
-        # Use 'vllm serve' command (vLLM 0.12.0+) instead of the old entry point
-        # The old 'python -m vllm.entrypoints.openai.api_server' can cause
-        # 'AttributeError: module vllm has no attribute sampling_params'
+        # Use provided model or default to base
+        serve_model = model_path or self.config.base_model
+        
+        # Build command
         cmd = [
-            "vllm", "serve", self.model_path,
-            "--host", "0.0.0.0",
-            "--port", str(self.port),
-            "--tensor-parallel-size", str(self.tensor_parallel_size),
-            "--max-model-len", str(self.max_model_len),
+            "vllm", "serve", serve_model,
+            "--host", self.config.vllm_host,
+            "--port", str(self.config.vllm_port),
             "--trust-remote-code",
             "--dtype", "bfloat16",
-            "--async-scheduling",  # Recommended by NVIDIA for better performance
+            "--gpu-memory-utilization", str(self.config.vllm_gpu_memory_utilization),
+            "--max-model-len", str(self.config.vllm_max_model_len),
             "--disable-log-requests",
         ]
         
-        self.logger.info(f"  Command: {' '.join(cmd)}")
+        # LoRA support (disabled for Nemotron-H until vLLM PR #30802 merges)
+        if self.config.vllm_enable_lora:
+            cmd.extend([
+                "--enable-lora",
+                "--max-lora-rank", str(self.config.vllm_max_lora_rank),
+            ])
         
-        # Start server in background
+        self._current_model_path = serve_model
+        
+        self.logger.info(f"vLLM command: {' '.join(cmd)}")
+        
+        # Start server process with real-time log streaming
+        self._stop_logging.clear()
+        self._log_file_path = os.path.join(self.config.output_dir, "vllm_server.log")
+        
         self.process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,  # Create new process group for clean shutdown
+            bufsize=1,
+            universal_newlines=True,
         )
-        self._start_time = time.time()
-        return True
+        
+        # Start log streaming thread
+        self._log_thread = threading.Thread(target=self._stream_logs, daemon=True)
+        self._log_thread.start()
+        
+        return self._wait_for_ready(timeout=300)
     
-    def wait_until_ready(self, timeout: int = 300) -> bool:
-        """Wait for the vLLM server to be ready."""
-        if self.process is None:
-            self.logger.error("vLLM server not started")
-            return False
+    def _stream_logs(self):
+        """Stream vLLM logs to console and file."""
+        with open(self._log_file_path, "a") as log_file:
+            for line in iter(self.process.stdout.readline, ''):
+                if self._stop_logging.is_set():
+                    break
+                line = line.rstrip()
+                if line:
+                    # Write to file
+                    log_file.write(line + "\n")
+                    log_file.flush()
+                    # Print to console with prefix
+                    print(f"[vLLM] {line}")
+    
+    def _wait_for_ready(self, timeout: int = 300) -> bool:
+        """Wait for vLLM server to be ready."""
+        start = time.time()
+        health_url = f"{self.base_url}/health"
         
-        start_time = getattr(self, '_start_time', time.time())
-        self.logger.info(f"Waiting for vLLM server to be ready (timeout={timeout}s)...")
+        print(f"\n[vLLM] Waiting for server at {health_url} (timeout={timeout}s)...")
         
-        while time.time() - start_time < timeout:
-            if self.is_running():
-                elapsed = time.time() - start_time
-                self.logger.info(f"✓ vLLM server ready in {elapsed:.1f}s")
-                return True
+        while time.time() - start < timeout:
+            try:
+                resp = requests.get(health_url, timeout=5)
+                if resp.status_code == 200:
+                    elapsed = time.time() - start
+                    self.logger.info(f"vLLM server ready in {elapsed:.1f}s")
+                    print(f"\n[vLLM] ✓ Server ready in {elapsed:.1f}s\n")
+                    return True
+            except requests.exceptions.RequestException:
+                pass
             
-            # Check if process died
-            if self.process.poll() is not None:
-                self.logger.error("vLLM server process died during startup")
-                stdout, _ = self.process.communicate()
-                if stdout:
-                    self.logger.error(f"Server output: {stdout.decode()[-2000:]}")
+            if self.process and self.process.poll() is not None:
+                self.logger.error("vLLM server process died!")
+                print("\n[vLLM] ✗ Server process died!")
                 return False
             
-            time.sleep(5)
+            time.sleep(2)
         
         self.logger.error(f"vLLM server failed to start within {timeout}s")
-        self.stop()
+        print(f"\n[vLLM] ✗ Server failed to start within {timeout}s")
         return False
     
-    def start(self, wait_timeout: int = 300) -> bool:
-        """Start the vLLM server and wait for it to be ready."""
-        if self.is_running():
-            self.logger.info(f"vLLM server already running on port {self.port}")
-            return True
-        
-        self.start_async()
-        return self.wait_until_ready(timeout=wait_timeout)
-    
     def is_running(self) -> bool:
-        """Check if the vLLM server is responding."""
+        """Check if vLLM server is running."""
         try:
             resp = requests.get(f"{self.base_url}/health", timeout=5)
             return resp.status_code == 200
-        except Exception:
+        except requests.exceptions.RequestException:
             return False
     
-    def stop(self):
-        """Stop the vLLM server."""
+    def stop_server(self):
+        """Stop the vLLM server and free GPU memory."""
         if self.process:
             self.logger.info("Stopping vLLM server...")
+            
+            # Stop log streaming
+            self._stop_logging.set()
+            
+            self.process.terminate()
             try:
-                # Kill the entire process group
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                self.process.wait(timeout=10)
-            except Exception as e:
-                self.logger.warning(f"Error stopping vLLM server: {e}")
-                try:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                except Exception:
-                    pass
+                self.process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            
+            # Wait for log thread to finish
+            if self._log_thread and self._log_thread.is_alive():
+                self._log_thread.join(timeout=2)
+            
             self.process = None
-            self.logger.info("vLLM server stopped")
+            self._current_model_path = None
+            
+            # Give GPU time to release memory
+            time.sleep(2)
+            free_gpu_memory()
+            self.logger.info("vLLM server stopped, GPU memory freed")
     
-    def __enter__(self):
-        self.start()
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop()
-        return False
+    @property
+    def current_model(self) -> Optional[str]:
+        return self._current_model_path
 
 
-def setup_vllm_environment(port: int = 8000):
-    """Set environment variables for the LLMClient to use our vLLM server."""
-    os.environ["CUSTOM_OPENAI_BASE_URL"] = f"http://localhost:{port}/v1"
-    os.environ["CUSTOM_OPENAI_API_KEY"] = "sk-local"
-    os.environ["CUSTOM_OPENAI_MODEL"] = "default"
-    os.environ["CUSTOM_OPENAI_TIMEOUT"] = "120"
+# ============================================================================
+# VLLM INFERENCE CLIENT
+# ============================================================================
+
+class VLLMInferenceClient:
+    """vLLM-based LLM client for fast inference during rollouts."""
+
+    def __init__(
+        self,
+        config: TreeRLConfig,
+        logger: logging.Logger,
+        server_manager: VLLMServerManager,
+    ):
+        self.config = config
+        self.logger = logger
+        self.server_manager = server_manager
+        self.base_url = f"http://{config.vllm_host}:{config.vllm_port}"
+        
+        try:
+            from api.system_prompts_updated import UNIFIED_SYSTEM_PROMPT
+            self.system_prompt = UNIFIED_SYSTEM_PROMPT.strip()
+        except ImportError:
+            self.system_prompt = "You are a helpful assistant."
+        
+        self._system_prompt_injection: Optional[str] = None
+        self.log_prompts = False
+        self.prompt_logger = logger
+        
+        self._json_requirements = (
+            "\n\n=== OUTPUT FORMAT ===\n"
+            "You MUST respond with ONLY a valid JSON object or array.\n"
+            "Do NOT include any reasoning, explanation, or text before or after the JSON.\n"
+            "Do NOT wrap the JSON in markdown code blocks.\n"
+            "Start your response with [ or { and end with ] or }.\n"
+            "===================\n"
+        )
+        self._max_json_retries = 4
+
+    def set_system_prompt_injection(self, prompt: Optional[str]) -> None:
+        self._system_prompt_injection = prompt
+
+    def clear_system_prompt_injection(self) -> None:
+        self._system_prompt_injection = None
+
+    def _current_system_prompt(self) -> str:
+        return (self._system_prompt_injection or self.system_prompt).strip()
+
+    def _extract_json_from_response(self, response_text: str) -> str:
+        """Extract JSON from model response, handling chain-of-thought/reasoning."""
+        import re
+        
+        if not response_text:
+            raise ValueError("No response text to parse.")
+
+        text = response_text.strip()
+
+        # Remove markdown code blocks
+        if "```json" in text:
+            match = re.search(r'```json\s*([\s\S]*?)\s*```', text)
+            if match:
+                text = match.group(1).strip()
+        elif "```" in text:
+            match = re.search(r'```\s*([\s\S]*?)\s*```', text)
+            if match:
+                text = match.group(1).strip()
+
+        # Try parsing the full text first
+        try:
+            json.loads(text)
+            return text
+        except Exception:
+            pass
+
+        # Try to find JSON array - use bracket matching for robustness
+        # This handles cases where model outputs reasoning before JSON
+        bracket_positions = []
+        for i, c in enumerate(text):
+            if c == '[':
+                bracket_positions.append(('array', i))
+            elif c == '{':
+                bracket_positions.append(('object', i))
+        
+        # Try each potential JSON start position
+        for json_type, start_pos in bracket_positions:
+            end_char = ']' if json_type == 'array' else '}'
+            
+            # Find matching bracket with depth tracking
+            depth = 0
+            end_pos = -1
+            in_string = False
+            escape_next = False
+            
+            for i in range(start_pos, len(text)):
+                c = text[i]
+                
+                if escape_next:
+                    escape_next = False
+                    continue
+                    
+                if c == '\\':
+                    escape_next = True
+                    continue
+                    
+                if c == '"':
+                    in_string = not in_string
+                    continue
+                    
+                if in_string:
+                    continue
+                    
+                if c == '[' or c == '{':
+                    depth += 1
+                elif c == ']' or c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_pos = i
+                        break
+            
+            if end_pos > start_pos:
+                candidate = text[start_pos:end_pos + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except Exception:
+                    continue
+        
+        # Fallback: simple find
+        start_a = text.find("[")
+        end_a = text.rfind("]")
+        if start_a != -1 and end_a != -1 and end_a > start_a:
+            candidate = text[start_a:end_a + 1]
+            try:
+                json.loads(candidate)
+                return candidate
+            except Exception:
+                pass
+
+        start_o = text.find("{")
+        end_o = text.rfind("}")
+        if start_o != -1 and end_o != -1 and end_o > start_o:
+            candidate = text[start_o:end_o + 1]
+            try:
+                json.loads(candidate)
+                return candidate
+            except Exception:
+                pass
+
+        raise ValueError(f"Failed to extract valid JSON from response: {response_text[:300]}...")
+
+    def _call_vllm_api(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+        requires_json: bool = False,
+    ) -> str:
+        """Call vLLM OpenAI-compatible API."""
+        gen_start = time.time()
+        
+        url = f"{self.base_url}/v1/chat/completions"
+        
+        # Use whatever model vLLM is currently serving
+        model_name = self.server_manager.current_model or self.config.base_model
+        
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": self.config.rollout_top_p,
+        }
+        
+        # Enable JSON mode for structured output
+        if requires_json:
+            payload["response_format"] = {"type": "json_object"}
+        
+        self.logger.debug(f"    [vLLM] Calling API...")
+        
+        try:
+            resp = requests.post(url, json=payload, timeout=300)
+            resp.raise_for_status()
+            result = resp.json()
+            
+            output_text = result["choices"][0]["message"]["content"].strip()
+            
+            usage = result.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            gen_elapsed = time.time() - gen_start
+            tok_per_sec = completion_tokens / gen_elapsed if gen_elapsed > 0 else 0
+            
+            self.logger.debug(
+                f"    [vLLM] Generated {completion_tokens} tokens in {gen_elapsed:.1f}s "
+                f"({tok_per_sec:.1f} tok/s, prompt={prompt_tokens})"
+            )
+            
+            return output_text
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"vLLM API error: {e}")
+            raise
+
+    def send_openai_request(
+        self,
+        prompt: str,
+        requires_json: bool = False,
+        temperature: float = 0.0,
+        **kwargs: Any,
+    ) -> str:
+        """Send a single-turn request with retry for JSON extraction."""
+        user_content = prompt.strip()
+        if requires_json:
+            user_content = f"{user_content.rstrip()}{self._json_requirements}"
+
+        messages = [
+            {"role": "system", "content": self._current_system_prompt()},
+            {"role": "user", "content": user_content},
+        ]
+
+        last_error = None
+        for attempt in range(self._max_json_retries if requires_json else 1):
+            try:
+                # Increase temperature on retries to get different outputs
+                retry_temp = temperature + (attempt * 0.1) if requires_json else temperature
+                
+                text = self._call_vllm_api(
+                    messages,
+                    temperature=min(retry_temp, 1.0),
+                    max_tokens=self.config.rollout_max_new_tokens,
+                    requires_json=requires_json,
+                )
+
+                if requires_json:
+                    cleaned = self._extract_json_from_response(text)
+                    json.loads(cleaned)  # Validate
+                    return cleaned
+                return text
+                
+            except (ValueError, json.JSONDecodeError) as e:
+                last_error = e
+                self.logger.warning(f"JSON extraction failed (attempt {attempt + 1}/{self._max_json_retries}): {str(e)[:100]}")
+                if attempt < self._max_json_retries - 1:
+                    continue
+                raise last_error
+
+    def send_trajectory_request(
+        self,
+        messages: List[Dict[str, str]],
+        requires_json: bool = False,
+        temperature: float = 0.0,
+        **kwargs: Any,
+    ) -> str:
+        """Send a multi-turn request with retry for JSON extraction."""
+        req_messages = [m.copy() for m in messages]
+        if requires_json:
+            for i in range(len(req_messages) - 1, -1, -1):
+                if req_messages[i].get("role") == "user":
+                    req_messages[i]["content"] = f"{req_messages[i]['content'].rstrip()}{self._json_requirements}"
+                    break
+
+        last_error = None
+        for attempt in range(self._max_json_retries if requires_json else 1):
+            try:
+                # Increase temperature on retries to get different outputs
+                retry_temp = temperature + (attempt * 0.1) if requires_json else temperature
+                
+                text = self._call_vllm_api(
+                    req_messages,
+                    temperature=min(retry_temp, 1.0),
+                    max_tokens=self.config.rollout_max_new_tokens,
+                    requires_json=requires_json,
+                )
+
+                if requires_json:
+                    cleaned = self._extract_json_from_response(text)
+                    json.loads(cleaned)  # Validate
+                    return cleaned
+                return text
+                
+            except (ValueError, json.JSONDecodeError) as e:
+                last_error = e
+                self.logger.warning(f"JSON extraction failed (attempt {attempt + 1}/{self._max_json_retries}): {str(e)[:100]}")
+                if attempt < self._max_json_retries - 1:
+                    continue
+                raise last_error
+
+    def send_vertex_ai_request(self, *args, **kwargs) -> str:
+        return self.send_openai_request(*args, **kwargs)
+
+    def send_groq_request(self, prompt: str, requires_json: bool = False, temperature: float = 0.0) -> str:
+        return self.send_openai_request(prompt=prompt, requires_json=requires_json, temperature=temperature)
 
 
 # ============================================================================
@@ -459,7 +644,6 @@ def load_chapter_rulings(config: TreeRLConfig, logger: logging.Logger) -> List[D
     with open(config.cross_rulings_file, 'r', encoding='utf-8') as f:
         all_rulings = json.load(f)
     
-    # Filter by chapter
     chapter_rulings = [
         r for r in all_rulings 
         if r.get("hts_code", "").startswith(config.chapter)
@@ -472,173 +656,183 @@ def load_chapter_rulings(config: TreeRLConfig, logger: logging.Logger) -> List[D
 
 
 # ============================================================================
-# STEP BOUNDARY DETECTION
+# SAMPLE SAVING (for debugging)
 # ============================================================================
 
-def find_assistant_turn_boundaries(
-    input_ids: torch.Tensor,
-    tokenizer,
-    messages: List[Dict[str, str]]
-) -> List[Tuple[int, int]]:
-    """
-    Find token boundaries for each assistant turn in the conversation.
+def save_samples_for_debug(
+    samples: List[Dict],
+    config: TreeRLConfig,
+    logger: logging.Logger,
+    epoch: int,
+    ruling_desc: str = "",
+) -> str:
+    """Save collected samples to disk for debugging."""
+    os.makedirs(config.samples_dir, exist_ok=True)
     
-    Returns list of (start_idx, end_idx) tuples for each assistant response.
-    """
-    boundaries = []
-    input_list = input_ids.tolist()
+    timestamp = int(time.time())
+    safe_desc = "".join(c if c.isalnum() else "_" for c in ruling_desc[:30])
+    filename = f"samples_epoch{epoch}_{safe_desc}_{timestamp}.json"
+    filepath = os.path.join(config.samples_dir, filename)
     
-    for i, msg in enumerate(messages):
-        if msg.get("role") != "assistant":
-            continue
+    # Prepare samples for JSON serialization
+    serializable_samples = []
+    for s in samples:
+        sample_copy = {
+            "messages": s.get("messages", []),
+            "step_rewards": s.get("step_rewards", []),
+            "gold_code": s.get("gold_code", ""),
+            "pred_trace": s.get("pred_trace", []),
+            "gold_trace": s.get("gold_trace", []),
+            "path_id": s.get("path_id", ""),
+            "leaf_reward": s.get("leaf_reward", 0),  # Fractional prefix match
+            "source": s.get("source", ""),
+        }
+        serializable_samples.append(sample_copy)
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(serializable_samples, f, indent=2, ensure_ascii=False)
+    
+    logger.info(f"  Saved {len(samples)} samples to: {filepath}")
+    return filepath
+
+
+def display_rollout_stats(
+    samples: List[Dict],
+    logger: logging.Logger,
+) -> None:
+    """
+    Display comprehensive stats after rollout phase, before training.
+    
+    Shows:
+    - Beam paths vs gold target comparisons
+    - Reward distributions
+    - Step reward statistics
+    - V(root) if available
+    """
+    if not samples:
+        logger.warning("No samples to display stats for")
+        return
+    
+    logger.info("\n" + "=" * 70)
+    logger.info("ROLLOUT STATISTICS (Before Training)")
+    logger.info("=" * 70)
+    
+    # Group samples by gold_code (ruling)
+    by_ruling = {}
+    for s in samples:
+        gold = s.get("gold_code", "unknown")
+        if gold not in by_ruling:
+            by_ruling[gold] = []
+        by_ruling[gold].append(s)
+    
+    logger.info(f"\n📊 OVERVIEW")
+    logger.info(f"  Total samples (beam paths): {len(samples)}")
+    logger.info(f"  Unique rulings: {len(by_ruling)}")
+    logger.info(f"  Avg paths per ruling: {len(samples) / len(by_ruling):.1f}")
+    
+    # Collect all rewards and step rewards
+    all_leaf_rewards = []
+    all_step_R = []
+    perfect_count = 0
+    partial_count = 0
+    zero_count = 0
+    
+    for s in samples:
+        leaf_r = s.get("leaf_reward", s.get("reward", 0))
+        all_leaf_rewards.append(leaf_r)
         
-        content = msg.get("content", "")
-        if not content:
-            continue
+        if leaf_r == 1.0:
+            perfect_count += 1
+        elif leaf_r > 0:
+            partial_count += 1
+        else:
+            zero_count += 1
         
-        # Tokenize this content to find it in the sequence
-        content_tokens = tokenizer.encode(content, add_special_tokens=False)
+        for sr in s.get("step_rewards", []):
+            all_step_R.append(sr.get("R", 0))
+    
+    # Leaf reward stats
+    logger.info(f"\n🎯 LEAF REWARDS (Prefix Match with Gold)")
+    logger.info(f"  Perfect (=1.0): {perfect_count} ({100*perfect_count/len(samples):.1f}%)")
+    logger.info(f"  Partial (0<r<1): {partial_count} ({100*partial_count/len(samples):.1f}%)")
+    logger.info(f"  Zero (=0): {zero_count} ({100*zero_count/len(samples):.1f}%)")
+    if all_leaf_rewards:
+        logger.info(f"  Min: {min(all_leaf_rewards):.3f}")
+        logger.info(f"  Max: {max(all_leaf_rewards):.3f}")
+        logger.info(f"  Mean: {sum(all_leaf_rewards)/len(all_leaf_rewards):.3f}")
+    
+    # Step reward stats
+    logger.info(f"\n📈 STEP REWARDS R(s) (TreeRL Process Supervision)")
+    if all_step_R:
+        logger.info(f"  Count: {len(all_step_R)}")
+        logger.info(f"  Min: {min(all_step_R):.4f}")
+        logger.info(f"  Max: {max(all_step_R):.4f}")
+        logger.info(f"  Mean: {sum(all_step_R)/len(all_step_R):.4f}")
+        neg_count = sum(1 for r in all_step_R if r < 0)
+        pos_count = sum(1 for r in all_step_R if r >= 0)
+        logger.info(f"  Negative: {neg_count} ({100*neg_count/len(all_step_R):.1f}%)")
+        logger.info(f"  Positive: {pos_count} ({100*pos_count/len(all_step_R):.1f}%)")
+    
+    # Per-ruling breakdown (show first few)
+    logger.info(f"\n🔍 BEAM PATHS vs GOLD (per ruling)")
+    logger.info("-" * 70)
+    
+    for i, (gold_code, ruling_samples) in enumerate(list(by_ruling.items())[:10]):
+        # Get gold trace
+        gold_trace = ruling_samples[0].get("gold_trace", [])
+        gold_path = " > ".join([
+            t.get("code", f"grp:{t.get('node_id', '?')}")[:8] 
+            for t in gold_trace
+        ])
         
-        if len(content_tokens) < 3:
-            continue
+        # Find best prediction
+        best_sample = max(ruling_samples, key=lambda s: s.get("leaf_reward", s.get("reward", 0)))
+        best_reward = best_sample.get("leaf_reward", best_sample.get("reward", 0))
+        pred_trace = best_sample.get("pred_trace", [])
+        pred_path = " > ".join([
+            t.get("code", f"grp:{t.get('node_id', '?')}")[:8]
+            for t in pred_trace
+        ])
         
-        # Search for the start of this content (use first few tokens as anchor)
-        search_len = min(5, len(content_tokens))
-        search_pattern = content_tokens[:search_len]
-        
-        for start_idx in range(len(input_list) - len(content_tokens) + 1):
-            if input_list[start_idx:start_idx + search_len] == search_pattern:
-                end_idx = start_idx + len(content_tokens)
-                boundaries.append((start_idx, end_idx))
+        # Count matches at each level
+        match_depth = 0
+        for j, (g, p) in enumerate(zip(gold_trace, pred_trace)):
+            g_key = g.get("code") or g.get("node_id")
+            p_key = p.get("code") or p.get("node_id")
+            if str(g_key) == str(p_key):
+                match_depth = j + 1
+            else:
                 break
+        
+        status = "✓ PERFECT" if best_reward == 1.0 else (f"◐ {match_depth}/{len(gold_trace)}" if best_reward > 0 else "✗ MISS")
+        
+        logger.info(f"\n  [{i+1}] Gold: {gold_code}")
+        logger.info(f"      Gold path:  {gold_path}")
+        logger.info(f"      Best pred:  {pred_path}")
+        logger.info(f"      Best leaf_r: {best_reward:.3f} | Paths: {len(ruling_samples)} | {status}")
+        
+        # Show step rewards for best path
+        step_Rs = [f"{sr.get('R', 0):.2f}" for sr in best_sample.get("step_rewards", [])]
+        if step_Rs:
+            logger.info(f"      Step R(s): [{', '.join(step_Rs)}]")
     
-    return boundaries
-
-
-def build_token_weights(
-    step_rewards: List[Dict],
-    boundaries: List[Tuple[int, int]],
-    seq_len: int,
-    device: str = "cuda"
-) -> torch.Tensor:
-    """
-    Build per-token weight tensor from step rewards.
+    if len(by_ruling) > 10:
+        logger.info(f"\n  ... and {len(by_ruling) - 10} more rulings")
     
-    Each token in an assistant turn gets weighted by R(s) for that step.
-    """
-    weights = torch.zeros(seq_len, device=device)
-    
-    # Map step index to R value
-    step_to_R = {sr["step"]: sr["R"] for sr in step_rewards}
-    
-    # Assign weights to each boundary
-    for step_idx, (start, end) in enumerate(boundaries):
-        if step_idx in step_to_R:
-            R = step_to_R[step_idx]
-            weights[start:end] = R
-    
-    return weights
+    logger.info("\n" + "=" * 70)
 
 
 # ============================================================================
-# GRPO LOSS FUNCTION
-# ============================================================================
-
-def compute_grpo_loss(
-    model,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    step_rewards: List[Dict],
-    boundaries: List[Tuple[int, int]],
-    device: str = "cuda"
-) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """
-    Compute GRPO loss with per-step R(s) weighting.
-    
-    Loss = -sum(R(s) * log_prob(token)) for tokens in step s
-    """
-    # CRITICAL: Ensure we're in training mode with gradients enabled
-    assert model.training, "Model must be in training mode for loss computation"
-    assert torch.is_grad_enabled(), "Gradients must be enabled for loss computation"
-    
-    # Forward pass - model should be in training mode
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        return_dict=True,
-    )
-    
-    logits = outputs.logits  # [1, seq_len, vocab_size]
-    
-    # Shift for next-token prediction
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = input_ids[:, 1:].contiguous()
-    shift_mask = attention_mask[:, 1:].contiguous()
-    
-    # Compute log probabilities
-    log_probs = F.log_softmax(shift_logits, dim=-1)
-    
-    # Gather log probs for actual tokens
-    token_log_probs = log_probs.gather(
-        dim=-1, 
-        index=shift_labels.unsqueeze(-1)
-    ).squeeze(-1)  # [1, seq_len-1]
-    
-    # Build per-token weights from step rewards
-    adjusted_boundaries = [(max(0, s-1), max(0, e-1)) for s, e in boundaries]
-    weights = build_token_weights(
-        step_rewards, 
-        adjusted_boundaries, 
-        shift_labels.shape[1],
-        device
-    ).unsqueeze(0)  # [1, seq_len-1]
-    
-    # Apply mask and weights
-    masked_log_probs = token_log_probs * shift_mask.float()
-    weighted_log_probs = masked_log_probs * weights
-    
-    # Normalize by number of weighted tokens
-    num_weighted = (weights.abs() > 0).sum().float()
-    if num_weighted > 0:
-        loss = -weighted_log_probs.sum() / num_weighted
-    else:
-        # Fallback: standard CE loss if no weights
-        loss = -masked_log_probs.sum() / shift_mask.sum().float()
-    
-    # Verify loss requires grad (sanity check)
-    assert loss.requires_grad, "Loss tensor must require gradients for training"
-    
-    # Compute metrics
-    metrics = {
-        "loss": loss.item(),
-        "avg_log_prob": masked_log_probs.sum().item() / max(shift_mask.sum().item(), 1),
-        "num_weighted_tokens": num_weighted.item(),
-        "avg_weight": weights.abs().sum().item() / max(num_weighted.item(), 1),
-        "max_weight": weights.max().item(),
-        "min_weight": weights.min().item(),
-    }
-    
-    return loss, metrics
-
-
-# ============================================================================
-# ONLINE ROLLOUT
+# ONLINE ROLLOUT (vLLM phase)
 # ============================================================================
 
 def run_online_rollout(
     ruling: Dict,
     config: TreeRLConfig,
     logger: logging.Logger,
+    vllm_client: VLLMInferenceClient,
 ) -> List[Dict]:
-    """
-    Run beam search rollout for a single ruling and compute TreeRL rewards.
-    
-    Uses vLLM server (via LLMClient) for fast inference.
-    
-    Returns:
-        List of training samples with messages and step_rewards
-    """
-    # Import TreeRL components
+    """Run rollout for a single ruling using vLLM."""
     try:
         from api.treerl_gold_trace import build_gold_trace, build_pred_trace_from_path
         from api.treerl_rewards import compute_leaf_reward
@@ -649,7 +843,6 @@ def run_online_rollout(
         logger.error(f"Could not import TreeRL components: {e}")
         return []
     
-    # Set beam size via environment
     os.environ["TREERL_BEAM_SIZE"] = str(config.beam_size)
     os.environ["TREERL_CHAPTER_BEAM_SIZE"] = str(config.beam_size)
     os.environ["DISABLE_CROSS_RULING_INJECTION"] = "true"
@@ -661,10 +854,17 @@ def run_online_rollout(
         logger.debug(f"  [rollout] Creating HTSTree...")
         hts_tree = HTSTree()
         
-        # HTSTree uses LLMClient which connects to vLLM via CUSTOM_OPENAI_BASE_URL
-        logger.debug(f"  [rollout] Using vLLM via LLMClient...")
+        logger.debug(f"  [rollout] Injecting vLLM client...")
+        hts_tree.llm_client = vllm_client
+        hts_tree.client = None
+        if hasattr(hts_tree, "classification_engine") and hasattr(hts_tree.classification_engine, "llm"):
+            hts_tree.classification_engine.llm = vllm_client
+        if hasattr(hts_tree, "streaming_engine"):
+            if hasattr(hts_tree.streaming_engine, "llm"):
+                hts_tree.streaming_engine.llm = vllm_client
+            if hasattr(hts_tree.streaming_engine, "llm_client"):
+                hts_tree.streaming_engine.llm_client = vllm_client
         
-        # Load HTS data
         logger.debug(f"  [rollout] Loading HTS data...")
         hts_data_file = script_dir / "api" / "hts_data.json"
         if hts_data_file.exists():
@@ -672,17 +872,14 @@ def run_online_rollout(
                 hts_data = json.load(f)
             hts_tree.build_from_json(hts_data)
         
-        # Build gold trace
         logger.debug(f"  [rollout] Building gold trace for {gold_code}...")
         gold_trace = build_gold_trace(gold_code, hts_tree.navigator)
         
-        # Initialize auto-responder
         logger.debug(f"  [rollout] Initializing auto-responder...")
         auto_responder = LLMAutoResponder(engine_name="groq", debug=False)
         if hasattr(auto_responder, "llm_client"):
-            auto_responder.llm_client = local_llm
+            auto_responder.llm_client = vllm_client
         
-        # Run classification
         logger.info(f"  [rollout] Starting classification (max_q={config.max_questions}, beam={config.beam_size})...")
         if config.max_questions > 0:
             result = auto_responder.interactive_classify_with_auto_response(
@@ -702,8 +899,6 @@ def run_online_rollout(
         logger.info(f"  [rollout] Classification complete")
         
         state = result.get("state", {})
-        
-        # Collect leaves
         leaves = []
         beam = state.get("beam", [])
         
@@ -731,7 +926,6 @@ def run_online_rollout(
                 "source": "final_beam",
             })
         
-        # Add pruned paths
         pruned_leaves = state.get("_treerl_pruned_leaves", [])
         for pruned in pruned_leaves:
             classification_path = pruned.get("classification_path", [])
@@ -754,10 +948,8 @@ def run_online_rollout(
             logger.warning(f"No leaves collected for ruling: {product_description[:50]}")
             return []
         
-        # Compute TreeRL rewards
         step_rewards, v_root = compute_treerl_rewards(leaves)
         
-        # Emit training samples
         samples = emit_leaf_samples(
             leaves,
             step_rewards,
@@ -777,162 +969,692 @@ def run_online_rollout(
 
 
 # ============================================================================
-# TRAINING LOOP
+# TRAINING FUNCTIONS (Unsloth phase)
 # ============================================================================
 
-def train_epoch(
-    model,
+def load_training_model(config: TreeRLConfig, logger: logging.Logger, adapter_path: Optional[str] = None):
+    """Load model with Unsloth for training."""
+    logger.info("=" * 70)
+    logger.info("LOADING TRAINING MODEL WITH UNSLOTH")
+    logger.info("=" * 70)
+    
+    from unsloth import FastLanguageModel
+    
+    # Determine which adapter to load
+    load_adapter = adapter_path or config.sft_adapter
+    
+    if load_adapter:
+        logger.info(f"Loading model with adapter: {load_adapter}")
+        
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=load_adapter,
+            max_seq_length=config.max_seq_length,
+            load_in_4bit=config.load_in_4bit,
+            trust_remote_code=True,
+            # offload_embedding=True,  # Disabled - causes device mismatch errors
+            # unsloth_tiled_mlp=True,  # Disabled - incompatible with Nemotron-H MLP
+        )
+        logger.info(f"Model + adapter loaded (4bit={config.load_in_4bit})")
+        
+        # Enable Unsloth gradient checkpointing for memory efficiency
+        # This offloads activations to CPU RAM, enabling 10x longer contexts
+        FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
+        logger.info("Enabled Unsloth gradient checkpointing (activation offloading)")
+        
+        # Ensure LoRA params are trainable (should already be, but explicit is safer)
+        lora_param_count = 0
+        for name, param in model.named_parameters():
+            if "lora" in name.lower():
+                param.requires_grad = True
+                lora_param_count += 1
+        logger.debug(f"Set requires_grad=True for {lora_param_count} LoRA parameters")
+        
+    else:
+        logger.info("Loading base model and creating fresh LoRA adapters")
+        
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=config.base_model,
+            max_seq_length=config.max_seq_length,
+            load_in_4bit=config.load_in_4bit,
+            trust_remote_code=True,
+            # offload_embedding=True,  # Disabled - causes device mismatch errors
+            # unsloth_tiled_mlp=True,  # Disabled - incompatible with Nemotron-H MLP
+        )
+        
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=config.lora_rank,
+            target_modules=list(config.lora_target_modules),
+            lora_alpha=config.lora_alpha,
+            lora_dropout=0.0,
+            bias="none",
+            use_gradient_checkpointing="unsloth",  # Offloads activations to CPU
+            random_state=3407,
+        )
+        logger.info(f"Fresh LoRA adapters added (rank={config.lora_rank}, 4bit={config.load_in_4bit})")
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    
+    # Log GPU memory usage
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved = torch.cuda.memory_reserved() / 1e9
+        logger.info(f"GPU memory after model load: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
+    
+    return model, tokenizer
+
+
+def unload_training_model(model, tokenizer, logger: logging.Logger):
+    """Unload training model and free GPU memory."""
+    logger.info("Unloading training model...")
+    del model
+    del tokenizer
+    free_gpu_memory()
+    logger.info("Training model unloaded, GPU memory freed")
+
+
+def find_assistant_turn_boundaries(
+    input_ids: torch.Tensor,
     tokenizer,
-    optimizer,
-    rulings: List[Dict],
-    config: TreeRLConfig,
-    logger: logging.Logger,
-    epoch: int,
-) -> Dict[str, float]:
+    messages: List[Dict[str, str]]
+) -> List[Tuple[int, int]]:
+    """Find token boundaries for each assistant turn."""
+    boundaries = []
+    input_list = input_ids.tolist()
+    
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "assistant":
+            continue
+        
+        content = msg.get("content", "")
+        if not content:
+            continue
+        
+        content_tokens = tokenizer.encode(content, add_special_tokens=False)
+        
+        if len(content_tokens) < 3:
+            continue
+        
+        search_len = min(5, len(content_tokens))
+        search_pattern = content_tokens[:search_len]
+        
+        for start_idx in range(len(input_list) - len(content_tokens) + 1):
+            if input_list[start_idx:start_idx + search_len] == search_pattern:
+                end_idx = start_idx + len(content_tokens)
+                boundaries.append((start_idx, end_idx))
+                break
+    
+    return boundaries
+
+
+def _get_path_depth(user_content: str) -> int:
     """
-    Train for one epoch with online rollouts.
+    Extract tree depth from path_so_far in a rank_candidates user message.
     
-    Rollouts use vLLM (via LLMClient).
-    Training uses the Unsloth model with LoRA.
+    path_so_far looks like: "84 - Chapter desc > 8481 - Heading desc > 8481.80 - Subheading"
+    Depth = number of '>' separators + 1 (for the chapter)
+    
+    Returns:
+        Depth in the tree (1 = at chapter, selecting heading, 2 = at heading, etc.)
+        Returns -1 if path_so_far not found.
     """
-    model.train()
+    import re
+    # Find path_so_far in JSON
+    match = re.search(r'"path_so_far":\s*"([^"]+)"', user_content)
+    if not match:
+        return -1
     
-    epoch_metrics = {
-        "total_loss": 0.0,
-        "num_samples": 0,
-        "num_rulings": 0,
-        "avg_reward": 0.0,
-    }
+    path = match.group(1)
+    # Count '>' separators - each one represents a level traversed
+    depth = path.count(' > ') + 1
+    return depth
+
+
+def build_token_weights(
+    step_rewards: List[Dict],
+    boundaries: List[Tuple[int, int]],
+    seq_len: int,
+    device: str = "cuda",
+    leaf_reward: Optional[float] = None,
+    messages: Optional[List[Dict]] = None,
+) -> torch.Tensor:
+    """
+    Build per-token weight tensor from step rewards.
     
-    # Sample rulings for this epoch
-    epoch_rulings = random.sample(
-        rulings, 
-        min(config.num_rulings_per_epoch, len(rulings))
+    TreeRL process supervision: Maps classification step rewards to assistant turns.
+    
+    Mapping logic:
+    - select_chapters_stage1/stage2 responses → step 0 (chapter selection)
+    - rank_candidates responses → step based on tree depth from path_so_far
+    - Q&A responses → weight 0 (excluded from training gradient)
+    
+    This correctly handles:
+    - Re-selections at the same level after Q&A (same step reward)
+    - Group nodes in the trace (included in step count)
+    - Q&A turns are NOT trained on (weight = 0)
+    
+    Args:
+        step_rewards: List of {step, R, trace_prefix, ...} from process supervision
+        boundaries: Token boundaries for each assistant turn
+        seq_len: Total sequence length
+        device: Device for tensor
+        leaf_reward: Fallback reward for edge cases
+        messages: Full message list to identify turn types and tree depth
+    """
+    weights = torch.zeros(seq_len, device=device)
+    
+    if not boundaries:
+        return weights
+    
+    # Build step index to R mapping
+    step_to_R = {sr["step"]: sr["R"] for sr in step_rewards}
+    max_step = max(step_to_R.keys()) if step_to_R else 0
+    
+    # Compute fallback reward for non-classification turns
+    if leaf_reward is not None:
+        fallback_R = leaf_reward
+    elif step_rewards:
+        fallback_R = sum(sr.get("R", 0.0) for sr in step_rewards) / len(step_rewards)
+    else:
+        fallback_R = 0.0
+    
+    # If we don't have messages, use simple sequential mapping
+    if not messages:
+        for bound_idx, (start, end) in enumerate(boundaries):
+            R = step_to_R.get(bound_idx, fallback_R)
+            weights[start:end] = R
+        return weights
+    
+    # Build mapping from message index to (assistant_turn_idx, step_idx)
+    # We need to look at USER messages to get path_so_far for depth
+    assistant_step_map = []  # List of step indices for each assistant turn
+    current_depth = 0  # Track tree depth from user prompts
+    
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        
+        if role == "user":
+            # Check if this is a rank_candidates prompt with path_so_far
+            if "rank_candidates" in content:
+                depth = _get_path_depth(content)
+                if depth > 0:
+                    current_depth = depth
+        
+        elif role == "assistant":
+            # Identify turn type
+            is_chapter_selection = (
+                '"chapters"' in content or 
+                '"top_selection"' in content or
+                'chapter-level' in content.lower()
+            )
+            is_rank_candidates = '"primary_selection"' in content and not is_chapter_selection
+            
+            if is_chapter_selection:
+                # Chapter selection stages all get step 0
+                assistant_step_map.append(0)
+            elif is_rank_candidates:
+                # Use current_depth from preceding user message
+                # Depth 1 = selecting at chapter level = step 1
+                # Depth 2 = selecting at heading level = step 2
+                # etc.
+                step_idx = current_depth
+                # Clamp to valid range
+                step_idx = min(step_idx, max_step)
+                assistant_step_map.append(step_idx)
+            else:
+                # Q&A or other - mark as -1 to use fallback
+                assistant_step_map.append(-1)
+    
+    # Apply weights to token boundaries
+    # Q&A turns (step_idx == -1) get weight 0 - excluded from training
+    for bound_idx, (start, end) in enumerate(boundaries):
+        if bound_idx < len(assistant_step_map):
+            step_idx = assistant_step_map[bound_idx]
+            if step_idx >= 0:
+                # Classification decision - use step reward
+                R = step_to_R.get(step_idx, fallback_R)
+            else:
+                # Q&A turn - exclude from training (weight = 0)
+                R = 0.0
+        else:
+            # Extra boundaries without messages - use fallback
+            R = fallback_R
+        
+        weights[start:end] = R
+    
+    return weights
+
+
+def compute_grpo_loss(
+    model,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    step_rewards: List[Dict],
+    boundaries: List[Tuple[int, int]],
+    device: str = "cuda",
+    leaf_reward: Optional[float] = None,
+    messages: Optional[List[Dict]] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Compute GRPO loss with per-step R(s) weighting."""
+    assert model.training, "Model must be in training mode"
+    assert torch.is_grad_enabled(), "Gradients must be enabled"
+    
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        return_dict=True,
     )
     
-    logger.info(f"Epoch {epoch+1}: Processing {len(epoch_rulings)} rulings")
+    logits = outputs.logits
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = input_ids[:, 1:].contiguous()
+    shift_mask = attention_mask[:, 1:].contiguous()
+    
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    token_log_probs = log_probs.gather(
+        dim=-1, 
+        index=shift_labels.unsqueeze(-1)
+    ).squeeze(-1)
+    
+    adjusted_boundaries = [(max(0, s-1), max(0, e-1)) for s, e in boundaries]
+    weights = build_token_weights(
+        step_rewards, 
+        adjusted_boundaries, 
+        shift_labels.shape[1],
+        device,
+        leaf_reward=leaf_reward,
+        messages=messages,
+    ).unsqueeze(0)
+    
+    masked_log_probs = token_log_probs * shift_mask.float()
+    weighted_log_probs = masked_log_probs * weights
+    
+    num_weighted = (weights.abs() > 0).sum().float()
+    if num_weighted > 0:
+        loss = -weighted_log_probs.sum() / num_weighted
+    else:
+        loss = -masked_log_probs.sum() / shift_mask.sum().float()
+    
+    assert loss.requires_grad, "Loss must require gradients"
+    
+    metrics = {
+        "loss": loss.item(),
+        "avg_log_prob": masked_log_probs.sum().item() / max(shift_mask.sum().item(), 1),
+        "num_weighted_tokens": num_weighted.item(),
+    }
+    
+    return loss, metrics
+
+
+def _safe_mean_std(values: List[float], eps: float) -> Tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    m = sum(values) / len(values)
+    var = sum((v - m) ** 2 for v in values) / max(len(values) - 1, 1)
+    std = math.sqrt(max(var, 0.0))
+    if std < eps:
+        std = 0.0
+    return m, std
+
+
+def _compute_group_ids_for_samples(samples: List[Dict]) -> List[str]:
+    """
+    Compute a group id per sample for group-wise normalization.
+
+    We group beam paths belonging to the same underlying ruling / prompt.
+    In this codebase, `gold_code` is the most stable key available on samples.
+    """
+    group_ids = []
+    for s in samples:
+        gid = s.get("group_id") or s.get("gold_code") or "unknown_group"
+        group_ids.append(str(gid))
+    return group_ids
+
+
+def _apply_grpo_group_normalization_inplace(
+    samples: List[Dict],
+    group_ids: List[str],
+    eps: float,
+    reward_key: str = "leaf_reward",
+) -> None:
+    """
+    GRPO-style group-relative normalization for a SINGLE scalar reward per sample.
+    Writes normalized scalar advantage to `sample["_advantage_scalar"]`.
+    """
+    # Build group -> indices
+    groups: Dict[str, List[int]] = {}
+    for idx, gid in enumerate(group_ids):
+        groups.setdefault(gid, []).append(idx)
+
+    for gid, idxs in groups.items():
+        rewards = []
+        for i in idxs:
+            r = samples[i].get(reward_key, samples[i].get("reward", 0.0))
+            try:
+                rewards.append(float(r))
+            except Exception:
+                rewards.append(0.0)
+
+        mean_r, std_r = _safe_mean_std(rewards, eps=eps)
+        for local_j, i in enumerate(idxs):
+            r = rewards[local_j]
+            if std_r > 0:
+                a = (r - mean_r) / (std_r + eps)
+            else:
+                a = 0.0
+            samples[i]["_advantage_scalar"] = float(a)
+
+
+def _apply_gdpo_normalization_inplace(
+    samples: List[Dict],
+    group_ids: List[str],
+    eps: float,
+    batch_norm: bool = True,
+) -> None:
+    """
+    GDPO-style advantage computation adapted to this script:
+
+    - Treat each TreeRL *step reward* R(step) as a separate "reward dimension".
+    - For each group (beam paths for the same ruling), normalize each step
+      reward independently (decoupled normalization).
+    - Sum normalized per-step advantages to get a scalar per-sample advantage.
+    - Optionally apply batch-wise normalization to keep a stable numerical scale.
+    - Distribute the final scalar advantage back to per-step advantages so the
+      existing per-token step-weighting continues to work.
+
+    Outputs:
+    - sample["_advantage_scalar"]: final scalar advantage after (optional) batch norm
+    - sample["_advantage_per_step"]: dict[int step -> float advantage contribution]
+    """
+    # Build group -> indices
+    groups: Dict[str, List[int]] = {}
+    for idx, gid in enumerate(group_ids):
+        groups.setdefault(gid, []).append(idx)
+
+    # First pass: per-group, per-step decoupled normalization
+    per_sample_step_a: List[Dict[int, float]] = [dict() for _ in samples]
+    per_sample_a_sum: List[float] = [0.0 for _ in samples]
+
+    for gid, idxs in groups.items():
+        # Collect all step indices present in this group
+        step_set = set()
+        for i in idxs:
+            for sr in samples[i].get("step_rewards", []) or []:
+                if "step" in sr:
+                    try:
+                        step_set.add(int(sr["step"]))
+                    except Exception:
+                        continue
+
+        if not step_set:
+            # No step rewards; leave at 0 (fallback handled downstream)
+            continue
+
+        steps = sorted(step_set)
+
+        # Build per-step list of rewards across group members
+        for step in steps:
+            r_vals = []
+            for i in idxs:
+                # Default missing step reward to 0
+                r_i = 0.0
+                for sr in samples[i].get("step_rewards", []) or []:
+                    try:
+                        if int(sr.get("step", -999999)) == step:
+                            r_i = float(sr.get("R", 0.0))
+                            break
+                    except Exception:
+                        continue
+                r_vals.append(r_i)
+
+            mean_r, std_r = _safe_mean_std(r_vals, eps=eps)
+            for local_j, i in enumerate(idxs):
+                r = r_vals[local_j]
+                if std_r > 0:
+                    a_step = (r - mean_r) / (std_r + eps)
+                else:
+                    a_step = 0.0
+                per_sample_step_a[i][step] = float(a_step)
+
+        # Sum per-step advantages per sample
+        for i in idxs:
+            a_sum = sum(per_sample_step_a[i].values()) if per_sample_step_a[i] else 0.0
+            per_sample_a_sum[i] = float(a_sum)
+
+    # Second pass: batch-wise normalization of the scalar summed advantages
+    if batch_norm:
+        mean_a, std_a = _safe_mean_std(per_sample_a_sum, eps=eps)
+        if std_a > 0:
+            a_hat = [float((a - mean_a) / (std_a + eps)) for a in per_sample_a_sum]
+        else:
+            a_hat = [0.0 for _ in per_sample_a_sum]
+    else:
+        a_hat = [float(a) for a in per_sample_a_sum]
+
+    # Third pass: distribute scalar advantage back to steps so token weights still work
+    for i in range(len(samples)):
+        samples[i]["_advantage_scalar"] = float(a_hat[i])
+
+        a_sum = per_sample_a_sum[i]
+        if not per_sample_step_a[i] or abs(a_sum) < eps:
+            samples[i]["_advantage_per_step"] = {}
+            continue
+
+        # Proportional distribution: ensures sum(step_contribs) == final scalar advantage
+        step_contribs = {}
+        for step, a_step in per_sample_step_a[i].items():
+            step_contribs[int(step)] = float(a_hat[i] * (a_step / (a_sum + eps)))
+        samples[i]["_advantage_per_step"] = step_contribs
+
+
+def _rewrite_sample_step_rewards_from_advantages_inplace(samples: List[Dict]) -> None:
+    """
+    If `_advantage_per_step` is present, rewrite each sample's `step_rewards[*].R`
+    to the normalized advantage contribution for that step.
+    """
+    for s in samples:
+        per_step = s.get("_advantage_per_step")
+        if not per_step:
+            continue
+        new_srs = []
+        for sr in s.get("step_rewards", []) or []:
+            step = sr.get("step")
+            try:
+                step_i = int(step)
+            except Exception:
+                new_srs.append(sr)
+                continue
+            sr2 = dict(sr)
+            sr2["R"] = float(per_step.get(step_i, 0.0))
+            new_srs.append(sr2)
+        s["step_rewards"] = new_srs
+
+
+def train_on_samples(
+    samples: List[Dict],
+    config: TreeRLConfig,
+    logger: logging.Logger,
+    adapter_path: Optional[str] = None,
+) -> Tuple[str, Optional[str], Dict[str, float]]:
+    """
+    Train on collected samples using Unsloth.
+    
+    Uses microbatch size of 1 with gradient accumulation to avoid OOM.
+    
+    Returns:
+        (new_adapter_path, merged_model_path, metrics)
+    """
+    logger.info(f"Training on {len(samples)} samples...")
+    logger.info(f"  Train max seq length: {config.train_max_seq_length}")
+    logger.info(f"  Gradient accumulation: {config.gradient_accumulation_steps}")
+    logger.info(f"  Advantage mode: {config.advantage_mode}")
+    
+    # Load training model
+    model, tokenizer = load_training_model(config, logger, adapter_path)
+    
+    # Setup optimizer
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = AdamW(
+        trainable_params,
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    
+    model.train()
+    
+    metrics = {
+        "total_loss": 0.0,
+        "num_samples": 0,
+        "skipped_too_long": 0,
+    }
+
+    # ---------------------------------------------------------
+    # Advantage normalization (GRPO / GDPO-style)
+    # ---------------------------------------------------------
+    # This is done once up front so per-sample training can remain sequential.
+    try:
+        group_ids = _compute_group_ids_for_samples(samples)
+        if config.advantage_mode == "gdpo":
+            _apply_gdpo_normalization_inplace(
+                samples,
+                group_ids=group_ids,
+                eps=config.gdpo_eps,
+                batch_norm=config.gdpo_batch_norm,
+            )
+            _rewrite_sample_step_rewards_from_advantages_inplace(samples)
+        elif config.advantage_mode == "grpo":
+            _apply_grpo_group_normalization_inplace(
+                samples,
+                group_ids=group_ids,
+                eps=config.gdpo_eps,
+                reward_key="leaf_reward",
+            )
+            # In GRPO mode, scale all step rewards by the sample scalar advantage.
+            # This preserves the existing per-step structure while injecting
+            # group-relative normalization.
+            for s in samples:
+                a = float(s.get("_advantage_scalar", 0.0))
+                if not s.get("step_rewards"):
+                    continue
+                s["step_rewards"] = [
+                    {**sr, "R": float(sr.get("R", 0.0)) * a}
+                    for sr in (s.get("step_rewards") or [])
+                ]
+        else:
+            # raw mode: keep current behavior
+            pass
+    except Exception as e:
+        logger.warning(f"Advantage normalization skipped due to error: {e}")
     
     accumulated_loss = 0.0
     accumulated_steps = 0
-    
     optimizer.zero_grad()
     
-    for ruling_idx, ruling in enumerate(epoch_rulings):
-        product_desc = ruling.get("short_product_description", "")[:50]
-        logger.info(f"  Ruling {ruling_idx+1}/{len(epoch_rulings)}: {product_desc}...")
+    for sample_idx, sample in enumerate(samples):
+        messages = sample.get("messages", [])
+        step_rewards = sample.get("step_rewards", [])
+        leaf_reward = sample.get("leaf_reward", sample.get("reward", None))
         
-        # Run online rollout using vLLM for inference
-        samples = run_online_rollout(ruling, config, logger)
-        
-        if not samples:
-            logger.warning(f"  No samples from rollout, skipping")
+        if not messages:
             continue
         
-        epoch_metrics["num_rulings"] += 1
-        
-        # Train on each sample
-        for sample in samples:
-            messages = sample.get("messages", [])
-            step_rewards = sample.get("step_rewards", [])
-            leaf_reward = sample.get("leaf_reward", 0.0)
-            
-            if not messages or not step_rewards:
-                continue
-            
-            # Tokenize the full trajectory
-            try:
-                text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=False
-                )
-                
-                inputs = tokenizer(
-                    text,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=config.max_seq_length,
-                    padding=False,
-                )
-                
-                input_ids = inputs["input_ids"].to(config.device)
-                attention_mask = inputs["attention_mask"].to(config.device)
-                
-            except Exception as e:
-                logger.warning(f"Tokenization error: {e}")
-                continue
-            
-            # Find assistant turn boundaries
-            boundaries = find_assistant_turn_boundaries(
-                input_ids[0], tokenizer, messages
+        try:
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False
             )
             
-            # Compute GRPO loss
-            try:
-                model.train()  # Ensure training mode
-                
-                loss, metrics = compute_grpo_loss(
-                    model,
-                    input_ids,
-                    attention_mask,
-                    step_rewards,
-                    boundaries,
-                    config.device
-                )
-                
-                # Scale loss for gradient accumulation
-                scaled_loss = loss / config.gradient_accumulation_steps
-                scaled_loss.backward()
-                
-                accumulated_loss += loss.item()
-                accumulated_steps += 1
-                
-                epoch_metrics["total_loss"] += loss.item()
-                epoch_metrics["num_samples"] += 1
-                epoch_metrics["avg_reward"] += leaf_reward
-                
-            except Exception as e:
-                logger.error(f"Loss computation error: {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
-                continue
-            
-            # Gradient accumulation step
-            if accumulated_steps >= config.gradient_accumulation_steps:
-                # Verify gradients are flowing (first time only)
-                if epoch_metrics["num_samples"] <= config.gradient_accumulation_steps:
-                    lora_grads = [p.grad for p in model.parameters() if p.requires_grad and p.grad is not None]
-                    if lora_grads:
-                        grad_norm = torch.sqrt(sum(g.pow(2).sum() for g in lora_grads)).item()
-                        logger.info(f"    Gradient check: {len(lora_grads)} LoRA params have grads, norm={grad_norm:.4f}")
-                    else:
-                        logger.warning("    WARNING: No gradients computed for LoRA parameters!")
-                
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), 
-                    config.max_grad_norm
-                )
-                
-                optimizer.step()
-                optimizer.zero_grad()
-                
-                avg_acc_loss = accumulated_loss / accumulated_steps
-                logger.info(f"    Step loss: {avg_acc_loss:.4f}")
-                
-                accumulated_loss = 0.0
-                accumulated_steps = 0
-        
-        # Log ruling progress
-        if (ruling_idx + 1) % config.log_every_n_steps == 0:
-            avg_loss = epoch_metrics["total_loss"] / max(epoch_metrics["num_samples"], 1)
-            logger.info(
-                f"  Progress: {ruling_idx+1}/{len(epoch_rulings)} rulings, "
-                f"{epoch_metrics['num_samples']} samples, avg_loss={avg_loss:.4f}"
+            inputs = tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=config.train_max_seq_length,  # Use training-specific limit
+                padding=False,
             )
+            
+            input_ids = inputs["input_ids"].to(config.device)
+            attention_mask = inputs["attention_mask"].to(config.device)
+            
+            seq_len = input_ids.shape[1]
+            
+            # Skip if truncated too much (lost important content)
+            if seq_len >= config.train_max_seq_length:
+                logger.debug(f"  Sample {sample_idx}: truncated to {seq_len} tokens")
+            
+        except Exception as e:
+            logger.warning(f"Tokenization error: {e}")
+            continue
         
-        # Free memory periodically
-        if (ruling_idx + 1) % 5 == 0:
-            gc.collect()
+        boundaries = find_assistant_turn_boundaries(
+            input_ids[0], tokenizer, messages
+        )
+        
+        try:
+            loss, loss_metrics = compute_grpo_loss(
+                model,
+                input_ids,
+                attention_mask,
+                step_rewards,
+                boundaries,
+                config.device,
+                leaf_reward=leaf_reward,
+                messages=messages,
+            )
+            
+            scaled_loss = loss / config.gradient_accumulation_steps
+            scaled_loss.backward()
+            
+            accumulated_loss += loss.item()
+            accumulated_steps += 1
+            
+            metrics["total_loss"] += loss.item()
+            metrics["num_samples"] += 1
+            
+            # Clear intermediate tensors to free memory
+            del input_ids, attention_mask, loss, scaled_loss
+            
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error(f"OOM on sample {sample_idx} (seq_len={seq_len}): {e}")
+            # Clear cache and skip this sample
+            torch.cuda.empty_cache()
+            optimizer.zero_grad()
+            accumulated_loss = 0.0
+            accumulated_steps = 0
+            continue
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"Loss computation error: {e}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            continue
+        
+        # Clear GPU cache periodically
+        if sample_idx % 4 == 0:
+            torch.cuda.empty_cache()
+        
+        if accumulated_steps >= config.gradient_accumulation_steps:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), 
+                config.max_grad_norm
+            )
+            
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            avg_acc_loss = accumulated_loss / accumulated_steps
+            logger.info(f"  Step {metrics['num_samples']}: loss={avg_acc_loss:.4f}")
+            
+            accumulated_loss = 0.0
+            accumulated_steps = 0
+            
+            # Clear cache after optimizer step
             torch.cuda.empty_cache()
     
     # Handle remaining gradients
@@ -941,222 +1663,137 @@ def train_epoch(
         optimizer.step()
         optimizer.zero_grad()
     
-    # Compute epoch averages
-    if epoch_metrics["num_samples"] > 0:
-        epoch_metrics["avg_loss"] = epoch_metrics["total_loss"] / epoch_metrics["num_samples"]
-        epoch_metrics["avg_reward"] = epoch_metrics["avg_reward"] / epoch_metrics["num_samples"]
+    # Save adapter (for checkpointing/resuming)
+    timestamp = int(time.time())
+    new_adapter_path = os.path.join(config.adapter_sync_dir, f"adapter_{timestamp}")
+    os.makedirs(new_adapter_path, exist_ok=True)
+    model.save_pretrained(new_adapter_path)
+    tokenizer.save_pretrained(new_adapter_path)
+    logger.info(f"Adapter saved to: {new_adapter_path}")
+    
+    # Merge LoRA into base model for vLLM (Nemotron-H LoRA unsupported in vLLM)
+    merged_path = os.path.join(config.adapter_sync_dir, f"merged_{timestamp}")
+    logger.info(f"Merging LoRA weights for vLLM serving...")
+    try:
+        model.save_pretrained_merged(
+            merged_path,
+            tokenizer,
+            save_method="merged_16bit",
+        )
+        logger.info(f"Merged model saved to: {merged_path}")
+    except Exception as e:
+        logger.error(f"Failed to merge model: {e}")
+        merged_path = None
+    
+    # Compute final metrics
+    if metrics["num_samples"] > 0:
+        metrics["avg_loss"] = metrics["total_loss"] / metrics["num_samples"]
     else:
-        epoch_metrics["avg_loss"] = 0.0
+        metrics["avg_loss"] = 0.0
     
-    return epoch_metrics
-
-
-# ============================================================================
-# EPOCH-END MERGE LOGIC
-# ============================================================================
-
-def merge_lora_into_merged_model(
-    model,
-    tokenizer,
-    config: TreeRLConfig,
-    logger: logging.Logger,
-    epoch: int,
-) -> None:
-    """
-    Merge the current LoRA weights into the merged model.
+    # Unload model
+    unload_training_model(model, tokenizer, logger)
     
-    After training LoRA for an epoch, we merge those weights back into
-    the merged model so subsequent epochs and inference use the updated weights.
-    """
-    from peft import PeftModel
-    
-    logger.info("=" * 60)
-    logger.info(f"MERGING EPOCH {epoch+1} LORA INTO MERGED MODEL")
-    logger.info("=" * 60)
-    
-    t0 = time.time()
-    
-    # Save current LoRA adapter temporarily
-    temp_adapter_dir = os.path.join(config.output_dir, f"temp_adapter_epoch_{epoch+1}")
-    os.makedirs(temp_adapter_dir, exist_ok=True)
-    
-    logger.info(f"[1/4] Saving current LoRA adapter...")
-    model.save_pretrained(temp_adapter_dir)
-    logger.info(f"       Saved to {temp_adapter_dir}")
-    
-    # Free the current model from GPU memory
-    logger.info("[2/4] Freeing GPU memory...")
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    # Load merged model in FP16/BF16 (not quantized) for merging
-    logger.info("[3/4] Loading merged model and new LoRA for merge...")
-    from transformers import AutoModelForCausalLM
-    
-    base_model = AutoModelForCausalLM.from_pretrained(
-        config.merged_model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    
-    # Load the LoRA adapter
-    peft_model = PeftModel.from_pretrained(base_model, temp_adapter_dir)
-    
-    # Merge and unload
-    logger.info("[4/4] Merging LoRA weights and saving...")
-    merged = peft_model.merge_and_unload()
-    
-    # Save back to merged_model_path (overwrite)
-    merged.save_pretrained(config.merged_model_path)
-    tokenizer.save_pretrained(config.merged_model_path)
-    
-    merge_time = time.time() - t0
-    logger.info(f"✓ Merge complete in {merge_time:.2f}s")
-    logger.info(f"✓ Updated merged model at: {config.merged_model_path}")
-    
-    # Cleanup
-    del merged, peft_model, base_model
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    # Clean up temp adapter
-    shutil.rmtree(temp_adapter_dir, ignore_errors=True)
-
-
-def reload_model_for_next_epoch(
-    config: TreeRLConfig,
-    logger: logging.Logger
-):
-    """
-    Reload the merged model with fresh LoRA for the next epoch.
-    Returns the new model and tokenizer.
-    
-    Note: vLLM server continues running - no need to restart it since
-    the merged model was already updated by merge_lora_into_merged_model.
-    We need to restart vLLM to pick up the new weights though.
-    """
-    logger.info("Reloading Unsloth model for next epoch...")
-    
-    model, tokenizer, using_unsloth = load_model_and_tokenizer(config, logger)
-    
-    return model, tokenizer, using_unsloth
+    return new_adapter_path, merged_path, metrics
 
 
 # ============================================================================
 # MAIN TRAINING FUNCTION
 # ============================================================================
 
-def ensure_merged_model_exists(config: TreeRLConfig, logger: logging.Logger) -> None:
-    """Ensure the merged model exists before starting vLLM."""
-    merged_config_path = os.path.join(config.merged_model_path, "config.json")
-    if not os.path.exists(merged_config_path):
-        if config.sft_adapter:
-            logger.info(f"Merged model not found at {config.merged_model_path}")
-            logger.info("Creating merged model from base + SFT adapter...")
-            merge_adapter_to_base(
-                config.base_model,
-                config.sft_adapter,
-                config.merged_model_path,
-                logger
-            )
-        else:
-            raise ValueError(f"No merged model at {config.merged_model_path} and no SFT adapter specified")
-    else:
-        logger.info(f"✓ Found existing merged model at {config.merged_model_path}")
+def merge_sft_adapter(config: TreeRLConfig, logger: logging.Logger) -> Optional[str]:
+    """Pre-merge SFT adapter for initial vLLM serving.
+    
+    Caches the merged model - if it already exists, skips re-merging.
+    """
+    if not config.sft_adapter:
+        logger.info("No SFT adapter specified, using base model")
+        return None
+    
+    merged_path = os.path.join(config.adapter_sync_dir, "sft_merged")
+    
+    # Check if already merged (look for config.json as indicator)
+    merged_config = os.path.join(merged_path, "config.json")
+    if os.path.exists(merged_config):
+        logger.info(f"✓ SFT merged model already exists: {merged_path}")
+        logger.info("  (delete this folder to force re-merge)")
+        return merged_path
+    
+    logger.info(f"Pre-merging SFT adapter: {config.sft_adapter}")
+    logger.info("  (this only happens once, cached for future runs)")
+    
+    from unsloth import FastLanguageModel
+    
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=config.sft_adapter,
+        max_seq_length=config.max_seq_length,
+        load_in_4bit=config.load_in_4bit,
+        trust_remote_code=True,
+    )
+    
+    logger.info(f"Merging SFT adapter to: {merged_path}")
+    
+    try:
+        model.save_pretrained_merged(
+            merged_path,
+            tokenizer,
+            save_method="merged_16bit",
+        )
+        logger.info(f"SFT merged model saved: {merged_path}")
+    except Exception as e:
+        logger.error(f"Failed to merge SFT adapter: {e}")
+        return None
+    
+    # Cleanup
+    del model, tokenizer
+    free_gpu_memory()
+    
+    return merged_path
 
 
 def train(config: TreeRLConfig):
-    """Main training function."""
+    """
+    Main training function with batched online RL.
     
-    # Setup logging
+    Flow per epoch:
+    1. Start vLLM with merged model
+    2. Run rollouts for ALL rulings in batch (collect samples)
+    3. Stop vLLM (free GPU)
+    4. Load Unsloth, train on all samples
+    5. Export LoRA adapter + merge for next vLLM cycle
+    6. Repeat
+    """
+    
     logger = setup_logging(config)
     
     logger.info("=" * 70)
-    logger.info("TREERL GRPO TRAINING (vLLM + UNSLOTH)")
+    logger.info("TREERL GRPO TRAINING (Batched: rollout batch → train → repeat)")
     logger.info("=" * 70)
     logger.info(f"Config: {config}")
     
-    # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
-    
-    # Step 1: Ensure merged model exists (needed for vLLM)
-    ensure_merged_model_exists(config, logger)
-    
-    # Step 2: Start vLLM server FIRST (let it load in background)
-    logger.info("=" * 70)
-    logger.info("STARTING VLLM SERVER FOR INFERENCE")
-    logger.info("=" * 70)
-    
-    vllm_server = VLLMServerManager(
-        model_path=config.merged_model_path,
-        port=config.vllm_port,
-        max_model_len=config.vllm_max_model_len,
-        logger=logger,
-    )
-    
-    # Start vLLM but don't wait yet - let it load while we load Unsloth
-    vllm_server.start_async()
-    logger.info("vLLM server starting in background...")
-    
-    # Step 3: Load Unsloth model while vLLM is starting
-    logger.info("=" * 70)
-    logger.info("LOADING UNSLOTH MODEL FOR TRAINING (parallel with vLLM)")
-    logger.info("=" * 70)
-    model, tokenizer, using_unsloth = load_model_and_tokenizer(config, logger)
-    
-    # Note: With Unsloth, model is already on the correct device
-    if not using_unsloth:
-        logger.info(f"Moving model to {config.device}...")
-        model.to(config.device)
-    logger.info("Unsloth model ready for training")
-    
-    # Step 4: Now wait for vLLM to be ready
-    logger.info("Waiting for vLLM server to be ready...")
-    if not vllm_server.wait_until_ready(timeout=300):
-        logger.error("Failed to start vLLM server. Exiting.")
-        vllm_server.stop()
-        return
-    
-    # Configure LLMClient to use our vLLM server
-    setup_vllm_environment(port=config.vllm_port)
-    logger.info(f"✓ vLLM server running at http://localhost:{config.vllm_port}")
-    logger.info(f"  LLMClient will use: {os.environ.get('CUSTOM_OPENAI_BASE_URL')}")
+    os.makedirs(config.adapter_sync_dir, exist_ok=True)
+    os.makedirs(config.samples_dir, exist_ok=True)
     
     # Load data
     rulings = load_chapter_rulings(config, logger)
-    
     if not rulings:
         logger.error(f"No rulings found for chapter {config.chapter}")
         return
     
-    # Setup optimizer - only train LoRA parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = AdamW(
-        trainable_params,
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+    # =============================================
+    # PHASE 0: PRE-MERGE SFT ADAPTER (for first rollout)
+    # =============================================
+    logger.info("\n--- Phase 0: Pre-merging SFT adapter for vLLM ---")
+    current_vllm_model = merge_sft_adapter(config, logger)
+    current_adapter_path = config.sft_adapter if config.sft_adapter else None
     
-    # Verify LoRA setup
-    lora_param_count = sum(p.numel() for p in trainable_params)
-    frozen_param_count = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    logger.info(f"Training setup verification:")
-    logger.info(f"  Trainable (LoRA) parameters: {lora_param_count:,}")
-    logger.info(f"  Frozen (base) parameters: {frozen_param_count:,}")
-    logger.info(f"  Optimizer param groups: {len(optimizer.param_groups)}")
-    
-    if lora_param_count == 0:
-        logger.error("NO TRAINABLE PARAMETERS! LoRA setup may have failed.")
-        return
-    
-    logger.info("=" * 70)
-    logger.info("STARTING TRAINING")
-    logger.info("=" * 70)
+    # Initialize vLLM server manager
+    vllm_manager = VLLMServerManager(config, logger)
     
     training_start = time.time()
     all_metrics = []
+    global_step = 0
     
     for epoch in range(config.num_epochs):
         epoch_start = time.time()
@@ -1165,97 +1802,153 @@ def train(config: TreeRLConfig):
         logger.info(f"EPOCH {epoch + 1}/{config.num_epochs}")
         logger.info(f"{'=' * 70}")
         
-        # Train epoch (rollouts use vLLM, training uses Unsloth)
-        epoch_metrics = train_epoch(
-            model, tokenizer, optimizer,
-            rulings, config, logger, epoch
+        # Sample rulings for this epoch
+        epoch_rulings = random.sample(
+            rulings, 
+            min(config.num_rulings_per_epoch, len(rulings))
         )
         
+        # =============================================
+        # PHASE 1: START VLLM WITH MERGED MODEL
+        # =============================================
+        logger.info(f"\n--- Phase 1: Starting vLLM server ---")
+        logger.info(f"  Model: {current_vllm_model or config.base_model}")
+        
+        if not vllm_manager.start_server(model_path=current_vllm_model):
+            logger.error("Failed to start vLLM server!")
+            return
+        
+        vllm_client = VLLMInferenceClient(config, logger, vllm_manager)
+        
+        # =============================================
+        # PHASE 2: RUN ROLLOUTS FOR ALL RULINGS IN BATCH
+        # =============================================
+        logger.info(f"\n--- Phase 2: Running rollouts for {len(epoch_rulings)} rulings ---")
+        
+        all_epoch_samples = []
+        
+        for ruling_idx, ruling in enumerate(epoch_rulings):
+            global_step += 1
+            product_desc = ruling.get("short_product_description", "")[:50]
+            
+            logger.info(f"\n  Ruling {ruling_idx+1}/{len(epoch_rulings)}: {product_desc}...")
+            
+            samples = run_online_rollout(ruling, config, logger, vllm_client)
+            
+            if samples:
+                all_epoch_samples.extend(samples)
+                logger.info(f"    → Collected {len(samples)} samples (total: {len(all_epoch_samples)})")
+            else:
+                logger.warning(f"    → No samples collected")
+        
+        # =============================================
+        # PHASE 3: STOP VLLM (FREE GPU)
+        # =============================================
+        logger.info(f"\n--- Phase 3: Stopping vLLM server ---")
+        vllm_manager.stop_server()
+        
+        # =============================================
+        # DEBUG: SAVE SAMPLES + DISPLAY STATS
+        # =============================================
+        if all_epoch_samples:
+            save_samples_for_debug(
+                all_epoch_samples,
+                config,
+                logger,
+                epoch=epoch + 1,
+                ruling_desc=f"epoch{epoch+1}_batch",
+            )
+            # Display comprehensive rollout stats before training
+            display_rollout_stats(all_epoch_samples, logger)
+        
+        # =============================================
+        # PHASE 4: TRAIN WITH UNSLOTH
+        # =============================================
+        if not all_epoch_samples:
+            logger.warning(f"No samples collected for epoch {epoch + 1}, skipping training")
+            continue
+        
+        logger.info(f"\n--- Phase 4: Training on {len(all_epoch_samples)} samples ---")
+        
+        new_adapter_path, merged_model_path, train_metrics = train_on_samples(
+            all_epoch_samples,
+            config,
+            logger,
+            adapter_path=current_adapter_path,
+        )
+        
+        # =============================================
+        # PHASE 5: UPDATE PATHS FOR NEXT CYCLE
+        # =============================================
+        current_adapter_path = new_adapter_path
+        current_vllm_model = merged_model_path
+        
+        avg_loss = train_metrics.get("avg_loss", 0)
+        
+        logger.info(f"\n--- Phase 5: Model updated ---")
+        logger.info(f"  Adapter: {new_adapter_path}")
+        logger.info(f"  Merged model: {merged_model_path}")
+        
+        # Record epoch metrics
+        all_metrics.append({
+            "epoch": epoch + 1,
+            "num_rulings": len(epoch_rulings),
+            "num_samples": train_metrics.get("num_samples", 0),
+            "avg_loss": avg_loss,
+            "adapter_path": new_adapter_path,
+            "merged_model_path": merged_model_path,
+        })
+        
+        # =============================================
+        # EPOCH COMPLETE
+        # =============================================
         epoch_time = time.time() - epoch_start
-        epoch_metrics["epoch_time"] = epoch_time
-        all_metrics.append(epoch_metrics)
         
-        # Log epoch summary
-        logger.info(f"\nEpoch {epoch + 1} Summary:")
-        logger.info(f"  Rulings processed: {epoch_metrics['num_rulings']}")
-        logger.info(f"  Samples trained: {epoch_metrics['num_samples']}")
-        logger.info(f"  Average loss: {epoch_metrics.get('avg_loss', 0):.4f}")
-        logger.info(f"  Average reward: {epoch_metrics.get('avg_reward', 0):.4f}")
-        logger.info(f"  Time: {epoch_time:.1f}s")
+        logger.info(f"\n{'=' * 50}")
+        logger.info(f"Epoch {epoch + 1} Summary:")
+        logger.info(f"  Rulings processed: {len(epoch_rulings)}")
+        logger.info(f"  Total samples: {len(all_epoch_samples)}")
+        logger.info(f"  Average loss: {avg_loss:.4f}")
+        logger.info(f"  Time: {epoch_time:.1f}s ({epoch_time/60:.1f}m)")
+        logger.info(f"{'=' * 50}")
         
-        # Save checkpoint (LoRA adapter)
-        if (epoch + 1) % config.save_every_n_epochs == 0:
+        # Save checkpoint
+        if (epoch + 1) % config.save_every_n_epochs == 0 and current_adapter_path:
+            import shutil
             checkpoint_dir = os.path.join(
                 config.output_dir, 
                 f"checkpoint-epoch-{epoch + 1}"
             )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            
-            model.save_pretrained(checkpoint_dir)
-            tokenizer.save_pretrained(checkpoint_dir)
-            
+            if os.path.exists(checkpoint_dir):
+                shutil.rmtree(checkpoint_dir)
+            shutil.copytree(current_adapter_path, checkpoint_dir)
             logger.info(f"  Checkpoint saved: {checkpoint_dir}")
-        
-        # Merge LoRA into merged model and reload for next epoch
-        # (Skip for the last epoch - we'll do final merge at the end)
-        if epoch < config.num_epochs - 1:
-            logger.info(f"\n  Merging epoch {epoch + 1} LoRA into merged model...")
-            
-            # Stop vLLM before merging (we'll restart with updated weights)
-            logger.info("  Stopping vLLM server for merge...")
-            vllm_server.stop()
-            
-            # Merge current LoRA into the merged model
-            merge_lora_into_merged_model(
-                model, tokenizer, config, logger, epoch
-            )
-            
-            # Reload Unsloth model with fresh LoRA for next epoch
-            model, tokenizer, using_unsloth = reload_model_for_next_epoch(
-                config, logger
-            )
-            
-            # Restart vLLM with the updated merged model
-            logger.info("  Restarting vLLM server with updated weights...")
-            if not vllm_server.start(wait_timeout=300):
-                logger.error("Failed to restart vLLM server. Exiting.")
-                return
-            
-            # Recreate optimizer for the new model's LoRA parameters
-            trainable_params = [p for p in model.parameters() if p.requires_grad]
-            optimizer = AdamW(
-                trainable_params,
-                lr=config.learning_rate,
-                weight_decay=config.weight_decay,
-            )
-            logger.info(f"  ✓ Ready for epoch {epoch + 2}")
     
-    # Training complete - cleanup
+    # Training complete
     total_time = time.time() - training_start
     
     logger.info("\n" + "=" * 70)
     logger.info("TRAINING COMPLETE")
     logger.info("=" * 70)
     logger.info(f"Total time: {total_time/60:.1f} minutes")
-    logger.info(f"Final average loss: {all_metrics[-1].get('avg_loss', 0):.4f}")
+    if all_metrics:
+        logger.info(f"Final average loss: {all_metrics[-1].get('avg_loss', 0):.4f}")
     
-    # Stop vLLM server
-    logger.info("\nStopping vLLM server...")
-    vllm_server.stop()
+    # Save final models
+    import shutil
+    if current_adapter_path:
+        final_adapter_dir = os.path.join(config.output_dir, "final_adapter")
+        if os.path.exists(final_adapter_dir):
+            shutil.rmtree(final_adapter_dir)
+        shutil.copytree(current_adapter_path, final_adapter_dir)
+        logger.info(f"Final adapter saved: {final_adapter_dir}")
     
-    # Save final LoRA adapter
-    final_lora_dir = os.path.join(config.output_dir, "final_lora")
-    os.makedirs(final_lora_dir, exist_ok=True)
-    model.save_pretrained(final_lora_dir)
-    tokenizer.save_pretrained(final_lora_dir)
-    logger.info(f"Final LoRA adapter saved: {final_lora_dir}")
-    
-    # Merge final LoRA into the merged model
-    logger.info("\nMerging final LoRA into merged model...")
-    merge_lora_into_merged_model(
-        model, tokenizer, config, logger, config.num_epochs - 1
-    )
-    logger.info(f"✓ Final merged model at: {config.merged_model_path}")
+    if current_vllm_model:
+        final_merged_dir = os.path.join(config.output_dir, "final_merged")
+        if os.path.exists(final_merged_dir):
+            shutil.rmtree(final_merged_dir)
+        shutil.copytree(current_vllm_model, final_merged_dir)
+        logger.info(f"Final merged model saved: {final_merged_dir}")
     
     # Save training metrics
     metrics_file = os.path.join(config.output_dir, "training_metrics.json")
@@ -1269,7 +1962,7 @@ def train(config: TreeRLConfig):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="TreeRL GRPO Training (Fixed for Unsloth)")
+    parser = argparse.ArgumentParser(description="TreeRL GRPO Training (vLLM + Unsloth)")
     
     # Model args
     parser.add_argument("--base-model", type=str, 
@@ -1277,18 +1970,25 @@ def main():
                        help="Base model name or path")
     parser.add_argument("--sft-adapter", type=str, 
                        default="orlandowhite/nemotron3_nano_sft",
-                       help="SFT LoRA adapter to merge into base (HF Hub or local path)")
+                       help="SFT LoRA adapter to continue training from")
     parser.add_argument("--no-sft-adapter", action="store_true",
-                       help="Train fresh LoRA from base model (don't merge SFT adapter)")
-    parser.add_argument("--merged-model-path", type=str,
-                       default="./nemotron-merged",
-                       help="Path to pre-merged model (will create if doesn't exist)")
-    parser.add_argument("--max-seq-length", type=int, default=8192,
-                       help="Maximum sequence length")
+                       help="Train fresh LoRA from base model")
+    parser.add_argument("--max-seq-length", type=int, default=80000,
+                       help="Maximum sequence length for model loading")
+    parser.add_argument("--train-max-seq-length", type=int, default=80000,
+                       help="Maximum sequence length per training sample")
     parser.add_argument("--no-4bit", action="store_true",
-                       help="Disable 4-bit quantization (use BF16)")
+                       help="Disable 4-bit quantization")
     parser.add_argument("--rollout-max-new-tokens", type=int, default=2048,
-                       help="Max new tokens per generation call during rollout")
+                       help="Max new tokens per generation during rollout")
+    
+    # vLLM args
+    parser.add_argument("--vllm-port", type=int, default=8000,
+                       help="vLLM server port")
+    parser.add_argument("--vllm-max-model-len", type=int, default=80000,
+                       help="vLLM max context length")
+    parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
+                       help="vLLM GPU memory utilization")
     
     # LoRA args
     parser.add_argument("--lora-rank", type=int, default=16,
@@ -1303,6 +2003,26 @@ def main():
                        help="Gradient accumulation steps")
     parser.add_argument("--epochs", type=int, default=3,
                        help="Number of epochs")
+
+    # Advantage / reward normalization
+    parser.add_argument(
+        "--advantage-mode",
+        type=str,
+        default="gdpo",
+        choices=["raw", "grpo", "gdpo"],
+        help="How to compute/normalize advantages from rewards (default: gdpo)",
+    )
+    parser.add_argument(
+        "--gdpo-eps",
+        type=float,
+        default=1e-6,
+        help="Epsilon for GDPO/GRPO normalization stability",
+    )
+    parser.add_argument(
+        "--no-gdpo-batch-norm",
+        action="store_true",
+        help="Disable batch-wise advantage normalization in GDPO",
+    )
     
     # Data args
     parser.add_argument("--chapter", type=str, default="84",
@@ -1323,23 +2043,20 @@ def main():
     parser.add_argument("--output-dir", type=str, default="treerl_checkpoints",
                        help="Output directory for checkpoints")
     
-    # vLLM args
-    parser.add_argument("--vllm-port", type=int, default=8000,
-                       help="Port for vLLM inference server")
-    
     args = parser.parse_args()
     
-    # Handle SFT adapter logic
     sft_adapter = args.sft_adapter if not args.no_sft_adapter else ""
     
-    # Build config
     config = TreeRLConfig(
         base_model=args.base_model,
         sft_adapter=sft_adapter,
-        merged_model_path=args.merged_model_path,
         max_seq_length=args.max_seq_length,
+        train_max_seq_length=args.train_max_seq_length,
         load_in_4bit=not args.no_4bit,
         rollout_max_new_tokens=args.rollout_max_new_tokens,
+        vllm_port=args.vllm_port,
+        vllm_max_model_len=args.vllm_max_model_len,
+        vllm_gpu_memory_utilization=args.vllm_gpu_util,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         learning_rate=args.lr,
@@ -1351,7 +2068,9 @@ def main():
         beam_size=args.beam_size,
         max_questions=args.max_questions,
         output_dir=args.output_dir,
-        vllm_port=args.vllm_port,
+        advantage_mode=args.advantage_mode,
+        gdpo_eps=args.gdpo_eps,
+        gdpo_batch_norm=not args.no_gdpo_batch_norm,
     )
     
     train(config)
