@@ -31,47 +31,97 @@ app = modal.App("treerl-training")
 volume = modal.Volume.from_name("treerl-data", create_if_missing=True)
 VOLUME_PATH = "/data"
 
-# Build image with all dependencies
+# =============================================================================
+# IMAGE CONFIGURATION - Pinned to working H200 setup (2026-01-09)
+# =============================================================================
+# Key versions from verified H200 install:
+#   - Python: 3.10.12
+#   - torch: 2.9.0+cu128  
+#   - CUDA: 12.8
+#   - triton: 3.5.0
+#   - mamba-ssm: 2.2.6.post3 (required for Nemotron-H)
+#   - causal-conv1d: 1.5.3.post1 (required for Nemotron-H)
+
 image = (
+    # Use CUDA 12.8 base to match working setup
     modal.Image.from_registry(
-        "nvidia/cuda:12.4.0-devel-ubuntu22.04",
-        add_python="3.11",
+        "nvidia/cuda:12.8.0-devel-ubuntu22.04",
+        add_python="3.10",
     )
-    .apt_install("git", "curl", "build-essential")
-    # PyTorch
+    .apt_install(
+        "git", 
+        "curl", 
+        "build-essential",
+        "g++",              # C++ compiler for CUDA extensions
+        "ninja-build",      # Fast builds for mamba-ssm/causal-conv1d
+        "python3.10-dev",   # Needed for some compiled packages
+    )
+    # Set compiler to g++ (not clang++)
+    .env({
+        "CC": "gcc",
+        "CXX": "g++",
+    })
+    # PyTorch 2.9.0 with CUDA 12.8 - exact working version
     .pip_install(
-        "torch>=2.4.0",
-        "triton>=3.0.0",
+        "torch==2.9.0",
+        "torchvision==0.24.0",
+        "triton==3.5.0",
+        extra_index_url="https://download.pytorch.org/whl/cu128",
     )
-    # Unsloth
+    # Build tools for CUDA extensions
+    .pip_install(
+        "ninja",       # Fast parallel builds
+        "packaging",   # Required by causal-conv1d setup
+        "wheel",
+    )
+    # Mamba/Causal-Conv1d - REQUIRED for Nemotron-H architecture
+    # Built from source with CUDA support
+    .pip_install(
+        "causal-conv1d==1.5.3.post1",
+        "mamba-ssm==2.2.6.post3",
+    )
+    # Unsloth - pinned to exact working commits
     .run_commands(
-        "pip install --no-deps 'unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git'"
+        "pip install --no-deps 'unsloth @ git+https://github.com/unslothai/unsloth.git@010775fbdebecf3f413002e593161393c72c0a09'",
+        "pip install --no-deps 'unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo.git@c315ec1b0782a43893f34ed1dc264de9f2600236'",
     )
+    # Training stack - exact versions from working setup
     .pip_install(
-        "xformers>=0.0.27",
-        "trl>=0.8.0",
+        "transformers==4.56.2",
+        "tokenizers==0.22.2",
+        "trl==0.22.2",
         "peft>=0.11.0",
         "accelerate>=0.30.0",
-        "bitsandbytes>=0.43.0",
-    )
-    # vLLM
-    .pip_install("vllm>=0.6.0")
-    # Core dependencies
-    .pip_install(
-        "transformers>=4.40.0",
+        "bitsandbytes==0.49.1",
         "datasets",
         "sentencepiece",
         "protobuf",
         "einops",
         "safetensors",
+    )
+    # vLLM for inference - use latest compatible with torch 2.9
+    .pip_install("vllm>=0.8.0")
+    # Utilities and API dependencies (from requirements.txt)
+    .pip_install(
         "requests",
         "openai",
+        "xformers",
+        "setuptools",  # Often needed for package builds
+        "rank-bm25",   # BM25 search for cross rulings
+        "pandas",      # Data processing
+        "openpyxl",    # Excel file support
+        "fastapi",     # API framework
+        "uvicorn",     # ASGI server
+        "pydantic",    # Data validation
+        "python-multipart",  # Form data handling
+        "google-auth",       # Google Cloud auth
+        "google-genai",      # Gemini API
+        "groq",              # Groq API
     )
-    # Copy your project code
+    # Copy your project code (excluding data - that goes to volume)
     .add_local_dir(
         local_path=".",
         remote_path="/app",
-        # Exclude large/unnecessary files
         ignore=[
             "*.pyc",
             "__pycache__",
@@ -81,6 +131,12 @@ image = (
             "treerl_checkpoints",
             ".venv",
             "node_modules",
+            # Large data files (upload to volume separately)
+            "*.json",
+            "*.jsonl", 
+            "*.xlsx",
+            "trajectory_*.json",
+            "notes",
         ],
     )
     .env({
@@ -183,18 +239,10 @@ def download_artifacts(artifact_path: str = "checkpoints/final"):
 
 
 # ============================================================================
-# MAIN TRAINING FUNCTION
+# TRAINING LOGIC (shared by all GPU configurations)
 # ============================================================================
 
-@app.function(
-    image=image,
-    gpu="H100",  # Options: "T4", "L4", "A10G", "A100", "A100-80GB", "H100"
-    volumes={VOLUME_PATH: volume},
-    timeout=86400,  # 24 hours
-    retries=modal.Retries(max_retries=2, initial_delay=60.0),
-    memory=32768,  # 32GB RAM
-)
-def train(
+def _run_training_impl(
     chapter: str = "84",
     num_rulings: int = 20,
     epochs: int = 3,
@@ -203,16 +251,22 @@ def train(
     learning_rate: float = 5e-5,
     base_model: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
     sft_adapter: str = "orlandowhite/nemotron3_nano_sft",
-    train_max_seq_length: int = 32000,
+    train_max_seq_length: int = 65536,
+    max_seq_length: int = 128000,
+    vllm_max_model_len: int = 128000,
     resume_checkpoint: str = None,
 ):
-    """
-    Run TreeRL GRPO training using your existing code.
-    
-    This function wraps treerl_grpo_train.py and runs it on Modal's GPUs.
-    """
+    """Core training logic - called by GPU-specific functions."""
     import subprocess
     import json
+    import torch
+    
+    # Log GPU info
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        for i in range(gpu_count):
+            print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+        print(f"Total GPUs: {gpu_count}")
     
     # Setup paths
     os.makedirs(f"{VOLUME_PATH}/checkpoints", exist_ok=True)
@@ -238,6 +292,8 @@ def train(
         "--lr", str(learning_rate),
         "--base-model", base_model,
         "--train-max-seq-length", str(train_max_seq_length),
+        "--max-seq-length", str(max_seq_length),
+        "--vllm-max-model-len", str(vllm_max_model_len),
         "--output-dir", f"{VOLUME_PATH}/checkpoints",
     ]
     
@@ -276,20 +332,64 @@ def train(
 
 
 # ============================================================================
+# GPU-SPECIFIC TRAINING FUNCTIONS
+# ============================================================================
+
+@app.function(
+    image=image,
+    gpu="H200",  # 1x H200 GPU
+    volumes={VOLUME_PATH: volume},
+    timeout=86400,
+    retries=modal.Retries(max_retries=2, initial_delay=60.0),
+    memory=32768,
+)
+def train_1gpu(**kwargs):
+    """Train with 1x H200 GPU (141GB VRAM)."""
+    return _run_training_impl(**kwargs)
+
+
+@app.function(
+    image=image,
+    gpu="H200:2",  # 2x H200 GPUs
+    volumes={VOLUME_PATH: volume},
+    timeout=86400,
+    retries=modal.Retries(max_retries=2, initial_delay=60.0),
+    memory=65536,
+)
+def train_2gpu(**kwargs):
+    """Train with 2x H200 GPUs."""
+    return _run_training_impl(**kwargs)
+
+
+@app.function(
+    image=image,
+    gpu="H200:4",  # 4x H200 GPUs
+    volumes={VOLUME_PATH: volume},
+    timeout=86400,
+    retries=modal.Retries(max_retries=2, initial_delay=60.0),
+    memory=65536,
+)
+def train(**kwargs):
+    """Train with 4x H200 GPUs (default)."""
+    return _run_training_impl(**kwargs)
+
+
+# ============================================================================
 # ALTERNATIVE: DIRECT PYTHON INTEGRATION
 # ============================================================================
 
 @app.function(
     image=image,
-    gpu="H100",
+    gpu="H200:4",  # 4x H200 GPUs
     volumes={VOLUME_PATH: volume},
     timeout=86400,
-    memory=32768,
+    memory=65536,
 )
 def train_direct(
     chapter: str = "84",
     num_rulings: int = 20,
     epochs: int = 3,
+    max_seq_length: int = 128000,
     **kwargs,
 ):
     """
@@ -339,7 +439,7 @@ def train_direct(
 
 @app.cls(
     image=image,
-    gpu="H100",
+    gpu="H200:4",  # 4x H200 for inference
     volumes={VOLUME_PATH: volume},
     timeout=3600,
     container_idle_timeout=300,  # Keep warm 5 min between calls
@@ -365,7 +465,8 @@ class VLLMRolloutEngine:
             trust_remote_code=True,
             dtype="bfloat16",
             gpu_memory_utilization=0.90,
-            max_model_len=55000,
+            max_model_len=128000,  # 128k context
+            tensor_parallel_size=4,  # Distribute across 4 GPUs
         )
         
         self.sampling_params = SamplingParams(
@@ -417,6 +518,7 @@ def main(
     upload_rulings: bool = False,
     rulings_file: str = "cross_rulings_dataset.json",
     list_only: bool = False,
+    gpus: int = 4,  # NEW: GPU count selector
 ):
     """
     Run TreeRL training on Modal.
@@ -449,16 +551,26 @@ def main(
     print("=" * 70)
     print("TreeRL GRPO Training on Modal")
     print("=" * 70)
+    print(f"GPUs: {gpus}x H200")
     print(f"Chapter: {chapter}")
     print(f"Epochs: {epochs}")
     print(f"Rulings per epoch: {num_rulings}")
     print()
     
-    result = train.remote(
+    # Select training function based on GPU count
+    train_kwargs = dict(
         chapter=chapter,
         num_rulings=num_rulings,
         epochs=epochs,
     )
+    
+    if gpus == 1:
+        result = train_1gpu.remote(**train_kwargs)
+    elif gpus == 2:
+        result = train_2gpu.remote(**train_kwargs)
+    else:
+        # Default: 4 GPUs
+        result = train.remote(**train_kwargs)
     
     print("\n" + "=" * 70)
     print("Training Complete!")

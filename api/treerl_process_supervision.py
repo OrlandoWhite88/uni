@@ -51,7 +51,10 @@ class PrefixTreeNode:
         self.R: float = 0.0  # Final step reward
 
 
-def build_prefix_tree(leaves: List[Dict[str, Any]]) -> PrefixTreeNode:
+def build_prefix_tree(
+    leaves: List[Dict[str, Any]],
+    reward_key: str = "reward",
+) -> PrefixTreeNode:
     """
     Build a prefix tree from collected leaves.
     
@@ -68,7 +71,9 @@ def build_prefix_tree(leaves: List[Dict[str, Any]]) -> PrefixTreeNode:
     
     for leaf in leaves:
         pred_trace = leaf.get("pred_trace", [])
-        reward = leaf.get("reward", 0.0)
+        reward = leaf.get(reward_key)
+        if reward is None:
+            reward = leaf.get("reward", 0.0)
         path_id = leaf.get("path_id", "unknown")
         
         # Convert trace to key format
@@ -186,7 +191,10 @@ def collect_step_rewards(root: PrefixTreeNode) -> Dict[tuple, Dict[str, float]]:
     return rewards
 
 
-def compute_treerl_rewards(leaves: List[Dict[str, Any]]) -> Tuple[Dict[tuple, Dict[str, float]], float]:
+def compute_treerl_rewards(
+    leaves: List[Dict[str, Any]],
+    reward_key: str = "reward",
+) -> Tuple[Dict[tuple, Dict[str, float]], float]:
     """
     Main entry point: compute all TreeRL rewards from leaves.
     
@@ -202,7 +210,7 @@ def compute_treerl_rewards(leaves: List[Dict[str, Any]]) -> Tuple[Dict[tuple, Di
         return {}, 0.0
     
     # Build prefix tree
-    root = build_prefix_tree(leaves)
+    root = build_prefix_tree(leaves, reward_key=reward_key)
     
     # Compute values
     v_root = compute_tree_values(root)

@@ -37,58 +37,106 @@ GPU_OPTIONS = {
     "a100-40gb": "A100",  
     "a100-80gb": "A100-80GB",
     "h100": "H100",
+    "h200": "H200",
+    "h200x4": "H200:4",  # 4x H200 for 128k context
     "l4": "L4",
     "a10g": "A10G",
     "t4": "T4",
 }
 
-# Build the Modal image with all dependencies
+# =============================================================================
+# IMAGE CONFIGURATION - Pinned to working H200 setup (2026-01-09)
+# =============================================================================
+# Key versions from verified H200 install:
+#   - Python: 3.10.12
+#   - torch: 2.9.0+cu128  
+#   - CUDA: 12.8
+#   - triton: 3.5.0
+#   - mamba-ssm: 2.2.6.post3 (required for Nemotron-H)
+#   - causal-conv1d: 1.5.3.post1 (required for Nemotron-H)
+
 def build_image():
     """Build Modal image with Unsloth, vLLM, and project dependencies."""
     
     return (
-        modal.Image.debian_slim(python_version="3.11")
+        # Use CUDA 12.8 base to match working H200 setup
+        modal.Image.from_registry(
+            "nvidia/cuda:12.8.0-devel-ubuntu22.04",
+            add_python="3.10",
+        )
         # System dependencies
         .apt_install(
             "git",
             "curl",
             "build-essential",
+            "g++",              # C++ compiler for CUDA extensions
+            "ninja-build",      # Fast builds for mamba-ssm/causal-conv1d
+            "python3.10-dev",
         )
-        # PyTorch with CUDA (required before Unsloth)
+        # Set compiler to g++ (not clang++)
+        .env({
+            "CC": "gcc",
+            "CXX": "g++",
+        })
+        # PyTorch 2.9.0 with CUDA 12.8 - exact working version
         .pip_install(
-            "torch>=2.4.0",
-            "triton>=3.0.0",
+            "torch==2.9.0",
+            "torchvision==0.24.0",
+            "triton==3.5.0",
+            extra_index_url="https://download.pytorch.org/whl/cu128",
         )
-        # Unsloth for efficient LoRA training
-        # Using pip install to get the latest compatible version
+        # Build tools for CUDA extensions
         .pip_install(
-            "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git",
-            extra_options="--no-deps",
+            "ninja",       # Fast parallel builds
+            "packaging",   # Required by causal-conv1d setup
+            "wheel",
         )
+        # Mamba/Causal-Conv1d - REQUIRED for Nemotron-H architecture
+        # Built from source with CUDA support
         .pip_install(
-            "xformers",
-            "trl>=0.8.0",
+            "causal-conv1d==1.5.3.post1",
+            "mamba-ssm==2.2.6.post3",
+        )
+        # Unsloth - pinned to exact working commits
+        .run_commands(
+            "pip install --no-deps 'unsloth @ git+https://github.com/unslothai/unsloth.git@010775fbdebecf3f413002e593161393c72c0a09'",
+            "pip install --no-deps 'unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo.git@c315ec1b0782a43893f34ed1dc264de9f2600236'",
+        )
+        # Training stack - exact versions from working setup
+        .pip_install(
+            "transformers==4.56.2",
+            "tokenizers==0.22.2",
+            "trl==0.22.2",
             "peft>=0.11.0",
             "accelerate>=0.30.0",
-            "bitsandbytes>=0.43.0",
+            "bitsandbytes==0.49.1",
+            "xformers",
         )
         # vLLM for fast inference during rollouts
-        .pip_install(
-            "vllm>=0.6.0",
-        )
+        .pip_install("vllm>=0.8.0")
         # Training utilities
         .pip_install(
-            "transformers>=4.40.0",
             "datasets",
             "sentencepiece",
             "protobuf",
             "einops",
             "safetensors",
         )
-        # API/utility dependencies from your project
+        # Utilities and API dependencies (from requirements.txt)
         .pip_install(
             "requests",
-            "openai",  # For API compatibility
+            "openai",
+            "setuptools",  # Often needed for package builds
+            "rank-bm25",   # BM25 search for cross rulings
+            "pandas",      # Data processing
+            "openpyxl",    # Excel file support
+            "fastapi",     # API framework
+            "uvicorn",     # ASGI server
+            "pydantic",    # Data validation
+            "python-multipart",  # Form data handling
+            "google-auth",       # Google Cloud auth
+            "google-genai",      # Gemini API
+            "groq",              # Groq API
         )
         # Set environment variables
         .env({
@@ -183,7 +231,7 @@ def download_checkpoint(checkpoint_name: str) -> bytes:
 
 @app.function(
     image=image,
-    gpu="H100",  # Default GPU, can be overridden
+    gpu="H200:4",  # 4x H200 GPUs for 128k context training
     volumes={VOLUME_PATH: volume},
     timeout=86400,  # 24 hours max
     retries=modal.Retries(
@@ -191,15 +239,15 @@ def download_checkpoint(checkpoint_name: str) -> bytes:
         backoff_coefficient=2.0,
         initial_delay=60.0,
     ),
-    # Memory for large models
-    memory=32768,  # 32GB system RAM
+    # Memory for large models with multi-GPU
+    memory=65536,  # 64GB system RAM
 )
 def train_treerl(
     # Model settings
     base_model: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
     sft_adapter: str = "orlandowhite/nemotron3_nano_sft",
-    max_seq_length: int = 55000,
-    train_max_seq_length: int = 32000,
+    max_seq_length: int = 128000,  # 128k context
+    train_max_seq_length: int = 65536,  # 64k per sample (distributed)
     load_in_4bit: bool = True,
     
     # Training settings
@@ -217,7 +265,8 @@ def train_treerl(
     
     # vLLM settings
     vllm_gpu_memory_utilization: float = 0.90,
-    vllm_max_model_len: int = 55000,
+    vllm_max_model_len: int = 128000,  # 128k context
+    vllm_tensor_parallel_size: int = 4,  # Distribute across 4 GPUs
     
     # Resume from checkpoint
     resume_from: str = None,
@@ -353,6 +402,7 @@ def train_treerl(
             "--dtype", "bfloat16",
             "--gpu-memory-utilization", str(vllm_gpu_memory_utilization),
             "--max-model-len", str(vllm_max_model_len),
+            "--tensor-parallel-size", str(vllm_tensor_parallel_size),
             "--disable-log-requests",
         ]
         
@@ -701,7 +751,7 @@ def train_treerl(
 
 @app.cls(
     image=image,
-    gpu="H100",
+    gpu="H200:4",  # 4x H200 for inference
     volumes={VOLUME_PATH: volume},
     timeout=7200,  # 2 hours
     container_idle_timeout=300,  # Keep warm for 5 minutes
@@ -726,7 +776,8 @@ class VLLMInference:
             trust_remote_code=True,
             dtype="bfloat16",
             gpu_memory_utilization=0.90,
-            max_model_len=55000,
+            max_model_len=128000,  # 128k context
+            tensor_parallel_size=4,  # Distribute across 4 GPUs
         )
         
         self.sampling_params = SamplingParams(
