@@ -1,42 +1,84 @@
 #!/usr/bin/env python3
-"""
-TreeRL GRPO Training Script with vLLM + Unsloth
+# =============================================================================
+# ENVIRONMENT VARIABLES - MUST BE SET BEFORE ANY IMPORTS
+# =============================================================================
+import os
 
-Architecture (Sequential GPU sharing - Batched RL):
+os.environ["UNSLOTH_ENABLE_LOGGING"] = "1"  # See any errors
+
+# DISABLE Unsloth vLLM standby - we manage vLLM externally
+os.environ["UNSLOTH_VLLM_STANDBY"] = "0"
+
+# CUDA memory management
+if "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
+    alloc_conf = os.environ["PYTORCH_CUDA_ALLOC_CONF"]
+    if "expandable_segments" in alloc_conf:
+        parts = [p for p in alloc_conf.split(",") if "expandable_segments" not in p]
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(parts) if parts else ""
+
+# Fast HF downloads
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+
+# Explicitly set vLLM device type
+os.environ.setdefault("VLLM_TARGET_DEVICE", "cuda")
+
+# =============================================================================
+# NOW SAFE TO IMPORT
+# =============================================================================
+"""
+TreeRL GRPO Training Script with Nemotron-3-Nano-30B-A3B (vLLM + Unsloth)
+
+ARCHITECTURE: External vLLM for inference, Pure Unsloth for training
+- vLLM runs as external server for rollouts (high throughput inference)
+- Unsloth loads model separately for training (fast_inference=False)
+- NO vLLM LoRA support for Nemotron - must MERGE adapters after training
+
+Model: NVIDIA Nemotron-3-Nano-30B-A3B
+- 30B parameters, ~3.6B active (MoE)
+- Uses <think>...</think> tags (token IDs 12, 13) for reasoning
+- 1M context window, NoPE (no positional embeddings - no YaRN needed)
+- BF16 and FP8 variants available
 
 Per-Epoch Flow:
     ┌─────────────────────────────────────────────────────────────────┐
-    │  PHASE 1: Load vLLM with merged SFT/LoRA model                  │
-    │           (first epoch uses pre-merged SFT adapter)             │
+    │  PHASE 1: Start vLLM server with current merged model           │
+    │           (No LoRA - model already has adapters merged)         │
     └─────────────────────────────────────────────────────────────────┘
                                     ↓
     ┌─────────────────────────────────────────────────────────────────┐
     │  PHASE 2: Run beam search rollouts for ALL rulings in batch     │
     │           Collect training samples from each ruling             │
+    │           (Nemotron thinking mode for better reasoning)         │
     └─────────────────────────────────────────────────────────────────┘
                                     ↓
     ┌─────────────────────────────────────────────────────────────────┐
-    │  PHASE 3: Stop vLLM server, free GPU memory                     │
+    │  PHASE 3: Stop vLLM server, free GPU memory completely          │
     └─────────────────────────────────────────────────────────────────┘
                                     ↓
     ┌─────────────────────────────────────────────────────────────────┐
-    │  PHASE 4: Load Unsloth, train LoRA on ALL collected samples     │
+    │  PHASE 4: Load base model with Unsloth, attach LoRA, train      │
+    │           Pure training mode - no internal vLLM                 │
     └─────────────────────────────────────────────────────────────────┘
                                     ↓
     ┌─────────────────────────────────────────────────────────────────┐
-    │  PHASE 5: Export LoRA adapter + merge into base for next vLLM   │
-    │           Unload Unsloth, free GPU memory                       │
+    │  PHASE 5: MERGE LoRA adapter into base model                    │
+    │           Save merged model for next vLLM cycle                 │
     └─────────────────────────────────────────────────────────────────┘
                                     ↓
                             [Next Epoch]
 
-This ensures vLLM and Unsloth never compete for GPU memory.
+Nemotron-3-Nano Recommended Settings:
+- General chat: temp=1.0, top_p=1.0
+- Tool calling: temp=0.6, top_p=0.95
+- max_new_tokens: 32,768 to 262,144 (up to 1M as memory allows)
 
 Usage:
-    python treerl_grpo_train.py --chapter 84 --num-rulings 20 --epochs 3
+    python treerl_grpo_nemotron.py --chapter 84 --num-rulings 20 --epochs 3
+    
+    # With FP8 for faster inference
+    python treerl_grpo_nemotron.py --use-fp8 --chapter 84
 """
 
-import os
 import sys
 import json
 import math
@@ -48,6 +90,9 @@ import subprocess
 import signal
 import requests
 import gc
+import re
+import threading
+import shutil
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -56,10 +101,6 @@ from datetime import datetime
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
-import threading
-
-# Enable expandable segments for better CUDA memory management with long contexts
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Add the api directory to path
 script_dir = Path(__file__).parent
@@ -73,31 +114,51 @@ sys.path.insert(0, str(api_dir))
 
 @dataclass
 class TreeRLConfig:
-    """Training configuration for TreeRL GRPO."""
+    """Training configuration for TreeRL GRPO with Nemotron-3-Nano."""
     
     # Model settings
+    # Nemotron-3-Nano has BF16 and FP8 variants
     base_model: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
-    sft_adapter: str = "orlandowhite/nemotron3_nano_sft"
-    max_seq_length: int = 55000  # For Unsloth model loading
-    # Training cap: keep trajectories under 32k to avoid OOM
-    train_max_seq_length: int = 32000  # Max tokens per training sample
-    load_in_4bit: bool = True
-    rollout_max_new_tokens: int = 2048
-    rollout_temperature: float = 0.7
+    use_fp8: bool = False  # Use FP8 variant for inference (faster but slightly less accurate)
+    
+    # Context length settings
+    # Nemotron-3-Nano: native 1M context, NoPE so no YaRN needed
+    max_seq_length: int = 262144  # Default safe value (can go up to 1M)
+    train_max_seq_length: int = 32768  # Max tokens per training sample (memory limited)
+    load_in_4bit: bool = True  # 4-bit quantization for training
+    
+    # Nemotron reasoning/thinking mode settings
+    enable_thinking: bool = True  # Enable thinking mode
+    # Nemotron uses <think> (token ID 12) and </think> (token ID 13)
+    
+    # Generation settings (Nemotron recommended)
+    # Tool calling / structured output: temp=0.6, top_p=0.95
+    # General chat: temp=1.0, top_p=1.0
+    rollout_temperature: float = 0.6  # For tool calling / classification
     rollout_top_p: float = 0.95
+    rollout_top_k: int = -1  # Not typically used with Nemotron
+    rollout_min_p: float = 0.0
+    
+    # Max output tokens cap
+    rollout_max_new_tokens_cap: int = 16384
     
     # vLLM settings
     vllm_host: str = "127.0.0.1"
     vllm_port: int = 8000
-    vllm_gpu_memory_utilization: float = 0.90
-    vllm_max_model_len: int = 55000
-    # NOTE: vLLM LoRA disabled - Nemotron-H conv1d/Mamba layers unsupported until PR #30802 merges
-    vllm_enable_lora: bool = False
-    vllm_max_lora_rank: int = 64
+    vllm_gpu_memory_utilization: float = 0.85
+    vllm_max_model_len: int = 262144  # Can increase up to 1M if memory allows
     
-    # LoRA settings
-    lora_rank: int = 16
-    lora_alpha: int = 32
+    # IMPORTANT: Nemotron does NOT support vLLM LoRA
+    # We must merge adapters after training and reload the full model
+    vllm_enable_lora: bool = False  # Must be False for Nemotron
+    
+    # Nemotron reasoning parser (download from HuggingFace)
+    use_reasoning_parser: bool = True
+    reasoning_parser_path: str = "nano_v3_reasoning_parser.py"
+    
+    # LoRA settings for training
+    lora_rank: int = 32
+    lora_alpha: int = 64  # 2x rank
     lora_target_modules: Tuple[str, ...] = (
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -109,6 +170,10 @@ class TreeRLConfig:
     warmup_steps: int = 10
     gradient_accumulation_steps: int = 4
     max_grad_norm: float = 1.0
+
+    # Advantage shaping / normalization
+    advantage_method: str = "gdpo"  # none | grpo | grpo_no_std | gdpo
+    gdpo_reward_weights: Tuple[float, ...] = (1.0, 1.0)
     
     # TreeRL settings
     beam_size: int = 4
@@ -116,22 +181,54 @@ class TreeRLConfig:
     
     # Data settings
     chapter: str = "84"
-    num_rulings_per_epoch: int = 20
+    rulings_per_batch: int = 5
+    accuracy_window_size: int = 10
+    num_batches: int = 20
     num_epochs: int = 3
+    train_all: bool = False
     
     # Paths
     cross_rulings_file: str = "cross_rulings_dataset.json"
-    output_dir: str = "treerl_checkpoints"
+    output_dir: str = "treerl_checkpoints_nemotron"
     log_file: str = "treerl_training.log"
-    adapter_sync_dir: str = "treerl_checkpoints/adapter_sync"
-    samples_dir: str = "treerl_checkpoints/samples"  # Debug: save collected samples
+    # Directory for merged models (NO adapter_sync - we merge instead)
+    merged_model_dir: str = "treerl_checkpoints_nemotron/merged_models"
+    samples_dir: str = "treerl_checkpoints_nemotron/samples"
+    completions_log: str = "treerl_checkpoints_nemotron/completions.jsonl"
+    
+    # Rollout caching
+    save_rollouts: str = ""
+    load_rollouts: str = ""
     
     # Logging
     log_every_n_steps: int = 1
     save_every_n_epochs: int = 1
     
+    # Wandb logging
+    use_wandb: bool = False
+    wandb_project: str = "treerl-grpo-nemotron"
+    wandb_run_name: str = ""
+    wandb_entity: str = ""
+    
     # Device
     device: str = "cuda"
+
+    # Leaf reward shaping
+    leaf_reward_weights: Tuple[float, ...] = (0.85, 0.15)
+    leaf_reward_clip_0_1: bool = True
+    
+    # CRITICAL: Disable fast_inference - we use external vLLM
+    use_fast_inference: bool = False
+    
+    # Safety margin for max_tokens calculation
+    token_safety_margin: int = 512
+    
+    @property
+    def inference_model(self) -> str:
+        """Get the model name for vLLM inference (respects FP8 flag)."""
+        if self.use_fp8:
+            return "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
+        return "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
 
 # ============================================================================
@@ -143,7 +240,11 @@ def setup_logging(config: TreeRLConfig) -> logging.Logger:
     logger = logging.getLogger("treerl_train")
     logger.setLevel(logging.DEBUG)
     
-    file_handler = logging.FileHandler(config.log_file)
+    os.makedirs(config.output_dir, exist_ok=True)
+    
+    log_path = os.path.join(config.output_dir, os.path.basename(config.log_file))
+    
+    file_handler = logging.FileHandler(log_path)
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(
         '%(asctime)s - %(levelname)s - %(message)s'
@@ -162,20 +263,92 @@ def setup_logging(config: TreeRLConfig) -> logging.Logger:
     return logger
 
 
-def free_gpu_memory():
+def free_gpu_memory(logger: Optional[logging.Logger] = None):
     """Aggressively free GPU memory."""
-    gc.collect()
+    if logger:
+        logger.info("  Freeing GPU memory...")
+    
+    for _ in range(3):
+        gc.collect()
+    
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+        if logger:
+            allocated_before = torch.cuda.memory_allocated() / 1e9
+            reserved_before = torch.cuda.memory_reserved() / 1e9
+            logger.info(f"    Before: {allocated_before:.2f}GB alloc, {reserved_before:.2f}GB reserved")
+        
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+        
+        if logger:
+            allocated_after = torch.cuda.memory_allocated() / 1e9
+            reserved_after = torch.cuda.memory_reserved() / 1e9
+            free_mem = torch.cuda.mem_get_info()[0] / 1e9
+            logger.info(f"    After:  {allocated_after:.2f}GB alloc, {reserved_after:.2f}GB reserved, {free_mem:.1f}GB free")
+
+
+def wait_for_gpu_memory(logger: logging.Logger, target_free_gb: float = 100.0, timeout: int = 60):
+    """Wait for GPU memory to be released."""
+    if not torch.cuda.is_available():
+        return True
+    
+    start = time.time()
+    while time.time() - start < timeout:
+        free_mem = torch.cuda.mem_get_info()[0] / 1e9
+        if free_mem >= target_free_gb:
+            logger.info(f"  ✓ GPU memory available: {free_mem:.1f}GB free")
+            return True
+        
+        logger.debug(f"  Waiting for GPU memory... {free_mem:.1f}GB free (target: {target_free_gb:.1f}GB)")
+        time.sleep(2)
+        free_gpu_memory()
+    
+    free_mem = torch.cuda.mem_get_info()[0] / 1e9
+    logger.warning(f"  ⚠️ Timeout waiting for GPU memory. Current: {free_mem:.1f}GB free")
+    return False
 
 
 # ============================================================================
-# VLLM SERVER MANAGEMENT
+# REASONING PARSER DOWNLOAD
+# ============================================================================
+
+def ensure_reasoning_parser(config: TreeRLConfig, logger: logging.Logger) -> Optional[str]:
+    """Download the Nemotron reasoning parser if needed."""
+    if not config.use_reasoning_parser:
+        return None
+    
+    parser_path = os.path.join(config.output_dir, config.reasoning_parser_path)
+    
+    if os.path.exists(parser_path):
+        logger.info(f"  Reasoning parser already exists: {parser_path}")
+        return parser_path
+    
+    logger.info("  Downloading Nemotron reasoning parser...")
+    
+    try:
+        url = "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/resolve/main/nano_v3_reasoning_parser.py"
+        
+        import urllib.request
+        os.makedirs(config.output_dir, exist_ok=True)
+        urllib.request.urlretrieve(url, parser_path)
+        
+        logger.info(f"  ✓ Downloaded reasoning parser to: {parser_path}")
+        return parser_path
+        
+    except Exception as e:
+        logger.warning(f"  Failed to download reasoning parser: {e}")
+        logger.warning("  Will proceed without custom reasoning parser")
+        return None
+
+
+# ============================================================================
+# VLLM SERVER MANAGEMENT (NO LORA SUPPORT)
 # ============================================================================
 
 class VLLMServerManager:
-    """Manages vLLM server lifecycle."""
+    """Manages vLLM server lifecycle for Nemotron (no LoRA - uses merged models)."""
     
     def __init__(self, config: TreeRLConfig, logger: logging.Logger):
         self.config = config
@@ -187,47 +360,74 @@ class VLLMServerManager:
         self._stop_logging = threading.Event()
     
     def start_server(self, model_path: Optional[str] = None) -> bool:
-        """Start vLLM server with specified model.
+        """
+        Start vLLM server with specified model (no LoRA support for Nemotron).
         
         Args:
-            model_path: Path to model to serve. If None, uses config.base_model.
-                       For Nemotron-H, pass a merged model path (LoRA unsupported).
+            model_path: Path to model to serve. If None, uses config.inference_model.
+                       Can be a merged model path or the base HF model.
         """
         if self.is_running():
             self.logger.info("vLLM server already running")
             return True
         
-        self.logger.info("Starting vLLM server...")
-        free_gpu_memory()
+        self.logger.info("Starting vLLM server for Nemotron-3-Nano...")
+        free_gpu_memory(self.logger)
         
-        # Use provided model or default to base
-        serve_model = model_path or self.config.base_model
+        # Wait for GPU memory
+        if not wait_for_gpu_memory(self.logger, target_free_gb=100.0, timeout=120):
+            self.logger.warning("  ⚠️ GPU memory may not be fully released, attempting anyway...")
         
-        # Build command
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        
+        # Use provided model or default
+        serve_model = model_path or self.config.inference_model
+        
+        # Build command for Nemotron
         cmd = [
             "vllm", "serve", serve_model,
             "--host", self.config.vllm_host,
             "--port", str(self.config.vllm_port),
             "--trust-remote-code",
-            "--dtype", "bfloat16",
             "--gpu-memory-utilization", str(self.config.vllm_gpu_memory_utilization),
             "--max-model-len", str(self.config.vllm_max_model_len),
-            "--disable-log-requests",
+            "--tensor-parallel-size", "1",
         ]
         
-        # LoRA support (disabled for Nemotron-H until vLLM PR #30802 merges)
-        if self.config.vllm_enable_lora:
+        # Add FP8-specific settings
+        if self.config.use_fp8 or "FP8" in serve_model:
             cmd.extend([
-                "--enable-lora",
-                "--max-lora-rank", str(self.config.vllm_max_lora_rank),
+                "--kv-cache-dtype", "fp8",
             ])
+            # Set environment for FP8 MoE
+            os.environ["VLLM_USE_FLASHINFER_MOE_FP8"] = "1"
+            os.environ["VLLM_FLASHINFER_MOE_BACKEND"] = "throughput"
+            self.logger.info("  FP8 mode enabled with FP8 KV cache")
+        
+        # Add async scheduling for better performance
+        cmd.append("--async-scheduling")
+        
+        # Add reasoning parser if available
+        parser_path = ensure_reasoning_parser(self.config, self.logger)
+        if parser_path and os.path.exists(parser_path):
+            cmd.extend([
+                "--enable-auto-tool-choice",
+                "--tool-call-parser", "qwen3_coder",
+                "--reasoning-parser-plugin", parser_path,
+                "--reasoning-parser", "nano_v3",
+            ])
+            self.logger.info(f"  Using Nemotron reasoning parser: {parser_path}")
         
         self._current_model_path = serve_model
         
         self.logger.info(f"vLLM command: {' '.join(cmd)}")
         
-        # Start server process with real-time log streaming
+        # Start server process
         self._stop_logging.clear()
+        os.makedirs(self.config.output_dir, exist_ok=True)
         self._log_file_path = os.path.join(self.config.output_dir, "vllm_server.log")
         
         self.process = subprocess.Popen(
@@ -242,23 +442,24 @@ class VLLMServerManager:
         self._log_thread = threading.Thread(target=self._stream_logs, daemon=True)
         self._log_thread.start()
         
-        return self._wait_for_ready(timeout=300)
+        return self._wait_for_ready(timeout=900)
     
     def _stream_logs(self):
         """Stream vLLM logs to console and file."""
-        with open(self._log_file_path, "a") as log_file:
-            for line in iter(self.process.stdout.readline, ''):
-                if self._stop_logging.is_set():
-                    break
-                line = line.rstrip()
-                if line:
-                    # Write to file
-                    log_file.write(line + "\n")
-                    log_file.flush()
-                    # Print to console with prefix
-                    print(f"[vLLM] {line}")
+        try:
+            with open(self._log_file_path, "a") as log_file:
+                for line in iter(self.process.stdout.readline, ''):
+                    if self._stop_logging.is_set():
+                        break
+                    line = line.rstrip()
+                    if line:
+                        log_file.write(line + "\n")
+                        log_file.flush()
+                        print(f"[vLLM] {line}")
+        except Exception as e:
+            print(f"[vLLM] Log streaming error: {e}")
     
-    def _wait_for_ready(self, timeout: int = 300) -> bool:
+    def _wait_for_ready(self, timeout: int = 900) -> bool:
         """Wait for vLLM server to be ready."""
         start = time.time()
         health_url = f"{self.base_url}/health"
@@ -300,26 +501,42 @@ class VLLMServerManager:
         if self.process:
             self.logger.info("Stopping vLLM server...")
             
-            # Stop log streaming
             self._stop_logging.set()
             
             self.process.terminate()
             try:
                 self.process.wait(timeout=30)
             except subprocess.TimeoutExpired:
+                self.logger.warning("  Force killing vLLM process...")
                 self.process.kill()
                 self.process.wait()
             
-            # Wait for log thread to finish
             if self._log_thread and self._log_thread.is_alive():
                 self._log_thread.join(timeout=2)
             
             self.process = None
             self._current_model_path = None
             
-            # Give GPU time to release memory
-            time.sleep(2)
-            free_gpu_memory()
+            self.logger.info("Waiting for GPU memory release...")
+            time.sleep(5)
+            
+            gc.collect()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            
+            free_gpu_memory(self.logger)
+            time.sleep(5)
+            wait_for_gpu_memory(self.logger, target_free_gb=100.0, timeout=60)
+            
             self.logger.info("vLLM server stopped, GPU memory freed")
     
     @property
@@ -328,11 +545,11 @@ class VLLMServerManager:
 
 
 # ============================================================================
-# VLLM INFERENCE CLIENT
+# VLLM INFERENCE CLIENT (Nemotron-specific)
 # ============================================================================
 
 class VLLMInferenceClient:
-    """vLLM-based LLM client for fast inference during rollouts."""
+    """vLLM-based LLM client for Nemotron-3-Nano with thinking mode."""
 
     def __init__(
         self,
@@ -345,16 +562,22 @@ class VLLMInferenceClient:
         self.server_manager = server_manager
         self.base_url = f"http://{config.vllm_host}:{config.vllm_port}"
         
+        # Try to load system prompt
         try:
             from api.system_prompts_updated import UNIFIED_SYSTEM_PROMPT
             self.system_prompt = UNIFIED_SYSTEM_PROMPT.strip()
         except ImportError:
-            self.system_prompt = "You are a helpful assistant."
+            self.system_prompt = "You are a helpful assistant specialized in HTS classification."
         
         self._system_prompt_injection: Optional[str] = None
+        
+        # Required attributes for classification_engine.py
         self.log_prompts = False
         self.prompt_logger = logger
+        self.client = None
+        self.model_name = config.base_model
         
+        # JSON extraction settings
         self._json_requirements = (
             "\n\n=== OUTPUT FORMAT ===\n"
             "You MUST respond with ONLY a valid JSON object or array.\n"
@@ -364,6 +587,13 @@ class VLLMInferenceClient:
             "===================\n"
         )
         self._max_json_retries = 4
+        
+        # Nemotron thinking tags (token IDs 12 and 13)
+        self._think_start = "<think>"
+        self._think_end = "</think>"
+        
+        # Token estimation
+        self._avg_chars_per_token = 3.5
 
     def set_system_prompt_injection(self, prompt: Optional[str]) -> None:
         self._system_prompt_injection = prompt
@@ -373,15 +603,106 @@ class VLLMInferenceClient:
 
     def _current_system_prompt(self) -> str:
         return (self._system_prompt_injection or self.system_prompt).strip()
-
-    def _extract_json_from_response(self, response_text: str) -> str:
-        """Extract JSON from model response, handling chain-of-thought/reasoning."""
-        import re
+    
+    def _estimate_token_count(self, text: str) -> int:
+        """Estimate token count for a string."""
+        return int(len(text) / self._avg_chars_per_token) + 10
+    
+    def _estimate_messages_tokens(self, messages: List[Dict[str, str]]) -> int:
+        """Estimate total tokens for messages including chat template overhead."""
+        total = 0
+        for msg in messages:
+            total += self._estimate_token_count(msg.get("content", ""))
+            # Nemotron chat template overhead per message
+            total += 25  # <|im_start|>role\n...<|im_end|>\n
+        total += 50
+        return total
+    
+    def _calculate_max_tokens(self, messages: List[Dict[str, str]], requested_max: Optional[int] = None) -> int:
+        """Calculate safe max_tokens based on input length."""
+        input_tokens = self._estimate_messages_tokens(messages)
+        available = self.config.vllm_max_model_len - input_tokens - self.config.token_safety_margin
         
+        if requested_max is not None:
+            safe_max = min(requested_max, available, self.config.rollout_max_new_tokens_cap)
+        else:
+            safe_max = min(available, self.config.rollout_max_new_tokens_cap)
+        
+        safe_max = max(safe_max, 256)
+        
+        if available < 1000:
+            self.logger.warning(
+                f"  ⚠️ Low available tokens: input≈{input_tokens}, "
+                f"available≈{available}, using max_tokens={safe_max}"
+            )
+        
+        return safe_max
+    
+    def _log_completion(self, request: Dict, response: Dict) -> None:
+        """Log completion to JSONL file."""
+        try:
+            log_path = self.config.completions_log
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            
+            messages = request.get("messages", [])
+            last_user_msg = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    last_user_msg = m.get("content", "")[:2000]
+                    break
+            
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "request": {
+                    "model": request.get("model"),
+                    "max_tokens": request.get("max_tokens"),
+                    "temperature": request.get("temperature"),
+                    "messages_count": len(messages),
+                    "last_user_msg_preview": last_user_msg,
+                },
+                "response": response,
+            }
+            
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                
+        except Exception as e:
+            self.logger.debug(f"Failed to log completion: {e}")
+
+    def _extract_thinking_and_content(self, response_text: str) -> Tuple[str, str]:
+        """
+        Extract thinking content and final response from Nemotron output.
+        
+        Nemotron format: <think>reasoning here</think>final answer here
+        """
+        if not response_text:
+            return "", ""
+        
+        text = response_text.strip()
+        
+        think_end_pos = text.find(self._think_end)
+        
+        if think_end_pos != -1:
+            think_start_pos = text.find(self._think_start)
+            if think_start_pos != -1:
+                thinking = text[think_start_pos + len(self._think_start):think_end_pos].strip()
+            else:
+                thinking = text[:think_end_pos].strip()
+            
+            content = text[think_end_pos + len(self._think_end):].strip()
+            return thinking, content
+        else:
+            if text.startswith(self._think_start):
+                return text[len(self._think_start):].strip(), ""
+            return "", text
+    
+    def _extract_json_from_response(self, response_text: str) -> str:
+        """Extract JSON from model response, handling chain-of-thought."""
         if not response_text:
             raise ValueError("No response text to parse.")
 
-        text = response_text.strip()
+        _, content = self._extract_thinking_and_content(response_text)
+        text = content.strip() if content else response_text.strip()
 
         # Remove markdown code blocks
         if "```json" in text:
@@ -393,15 +714,13 @@ class VLLMInferenceClient:
             if match:
                 text = match.group(1).strip()
 
-        # Try parsing the full text first
         try:
             json.loads(text)
             return text
         except Exception:
             pass
 
-        # Try to find JSON array - use bracket matching for robustness
-        # This handles cases where model outputs reasoning before JSON
+        # Find JSON with bracket matching
         bracket_positions = []
         for i, c in enumerate(text):
             if c == '[':
@@ -409,11 +728,7 @@ class VLLMInferenceClient:
             elif c == '{':
                 bracket_positions.append(('object', i))
         
-        # Try each potential JSON start position
         for json_type, start_pos in bracket_positions:
-            end_char = ']' if json_type == 'array' else '}'
-            
-            # Find matching bracket with depth tracking
             depth = 0
             end_pos = -1
             in_string = False
@@ -452,8 +767,8 @@ class VLLMInferenceClient:
                     return candidate
                 except Exception:
                     continue
-        
-        # Fallback: simple find
+
+        # Fallback
         start_a = text.find("[")
         end_a = text.rfind("]")
         if start_a != -1 and end_a != -1 and end_a > start_a:
@@ -474,43 +789,55 @@ class VLLMInferenceClient:
             except Exception:
                 pass
 
-        raise ValueError(f"Failed to extract valid JSON from response: {response_text[:300]}...")
+        raise ValueError(f"Failed to extract valid JSON from response: {response_text[:500]}...")
 
     def _call_vllm_api(
         self,
         messages: List[Dict[str, str]],
         temperature: float,
-        max_tokens: int,
+        max_tokens: Optional[int] = None,
         requires_json: bool = False,
     ) -> str:
-        """Call vLLM OpenAI-compatible API."""
+        """Call vLLM API with Nemotron settings."""
         gen_start = time.time()
         
         url = f"{self.base_url}/v1/chat/completions"
         
-        # Use whatever model vLLM is currently serving
-        model_name = self.server_manager.current_model or self.config.base_model
+        model_name = self.server_manager.current_model or self.config.inference_model
+        
+        safe_max_tokens = self._calculate_max_tokens(messages, max_tokens)
+        
+        # Nemotron sampling parameters
+        if requires_json:
+            # Slightly lower temp for structured output
+            effective_temp = 0.6
+            effective_top_p = 0.95
+        else:
+            effective_temp = temperature if temperature > 0 else self.config.rollout_temperature
+            effective_top_p = self.config.rollout_top_p
         
         payload = {
             "model": model_name,
             "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": self.config.rollout_top_p,
+            "max_tokens": safe_max_tokens,
+            "temperature": effective_temp,
+            "top_p": effective_top_p,
         }
         
-        # Enable JSON mode for structured output
-        if requires_json:
-            payload["response_format"] = {"type": "json_object"}
-        
-        self.logger.debug(f"    [vLLM] Calling API...")
+        # Nemotron doesn't use top_k by default
+        if self.config.rollout_top_k > 0:
+            payload["top_k"] = self.config.rollout_top_k
         
         try:
             resp = requests.post(url, json=payload, timeout=300)
             resp.raise_for_status()
             result = resp.json()
             
-            output_text = result["choices"][0]["message"]["content"].strip()
+            self._log_completion(payload, result)
+            
+            choice = result.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            finish_reason = choice.get("finish_reason", "unknown")
             
             usage = result.get("usage", {})
             prompt_tokens = usage.get("prompt_tokens", 0)
@@ -519,11 +846,34 @@ class VLLMInferenceClient:
             tok_per_sec = completion_tokens / gen_elapsed if gen_elapsed > 0 else 0
             
             self.logger.debug(
-                f"    [vLLM] Generated {completion_tokens} tokens in {gen_elapsed:.1f}s "
-                f"({tok_per_sec:.1f} tok/s, prompt={prompt_tokens})"
+                f"    [vLLM] {completion_tokens} tokens in {gen_elapsed:.1f}s "
+                f"({tok_per_sec:.1f} tok/s, prompt={prompt_tokens}, max={safe_max_tokens}, finish={finish_reason})"
             )
             
-            return output_text
+            if finish_reason == "length":
+                self.logger.warning(f"  ⚠️ Hit max_tokens ({safe_max_tokens})!")
+            
+            output_text = message.get("content") or ""
+            reasoning_text = message.get("reasoning_content") or ""
+            
+            if not output_text and reasoning_text:
+                output_text = f"{self._think_start}{reasoning_text}{self._think_end}"
+                self.logger.debug("  Reconstructed response from reasoning_content")
+            
+            if output_text and self._think_start in output_text:
+                thinking, _ = self._extract_thinking_and_content(output_text)
+                if thinking:
+                    self.logger.debug(f"  Thinking tokens: ~{len(thinking.split())}")
+            
+            if not output_text:
+                output_text = choice.get("text") or ""
+            
+            if output_text:
+                self.logger.debug(f"    [vLLM Response] len={len(output_text)}")
+            else:
+                self.logger.warning(f"vLLM returned empty content (tokens={completion_tokens})")
+            
+            return output_text.strip()
             
         except requests.exceptions.RequestException as e:
             self.logger.error(f"vLLM API error: {e}")
@@ -534,13 +884,15 @@ class VLLMInferenceClient:
         prompt: str,
         requires_json: bool = False,
         temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
         **kwargs: Any,
     ) -> str:
         """Send a single-turn request with retry for JSON extraction."""
         user_content = prompt.strip()
+        
         if requires_json:
             user_content = f"{user_content.rstrip()}{self._json_requirements}"
-
+        
         messages = [
             {"role": "system", "content": self._current_system_prompt()},
             {"role": "user", "content": user_content},
@@ -549,19 +901,21 @@ class VLLMInferenceClient:
         last_error = None
         for attempt in range(self._max_json_retries if requires_json else 1):
             try:
-                # Increase temperature on retries to get different outputs
                 retry_temp = temperature + (attempt * 0.1) if requires_json else temperature
                 
                 text = self._call_vllm_api(
                     messages,
                     temperature=min(retry_temp, 1.0),
-                    max_tokens=self.config.rollout_max_new_tokens,
+                    max_tokens=max_tokens,
                     requires_json=requires_json,
                 )
 
+                if not text or not text.strip():
+                    raise ValueError("Empty response from vLLM API")
+
                 if requires_json:
                     cleaned = self._extract_json_from_response(text)
-                    json.loads(cleaned)  # Validate
+                    json.loads(cleaned)
                     return cleaned
                 return text
                 
@@ -577,9 +931,10 @@ class VLLMInferenceClient:
         messages: List[Dict[str, str]],
         requires_json: bool = False,
         temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
         **kwargs: Any,
     ) -> str:
-        """Send a multi-turn request with retry for JSON extraction."""
+        """Send a multi-turn request."""
         req_messages = [m.copy() for m in messages]
         if requires_json:
             for i in range(len(req_messages) - 1, -1, -1):
@@ -590,19 +945,21 @@ class VLLMInferenceClient:
         last_error = None
         for attempt in range(self._max_json_retries if requires_json else 1):
             try:
-                # Increase temperature on retries to get different outputs
                 retry_temp = temperature + (attempt * 0.1) if requires_json else temperature
                 
                 text = self._call_vllm_api(
                     req_messages,
                     temperature=min(retry_temp, 1.0),
-                    max_tokens=self.config.rollout_max_new_tokens,
+                    max_tokens=max_tokens,
                     requires_json=requires_json,
                 )
 
+                if not text or not text.strip():
+                    raise ValueError("Empty response from vLLM API")
+
                 if requires_json:
                     cleaned = self._extract_json_from_response(text)
-                    json.loads(cleaned)  # Validate
+                    json.loads(cleaned)
                     return cleaned
                 return text
                 
@@ -613,11 +970,23 @@ class VLLMInferenceClient:
                     continue
                 raise last_error
 
+    # Compatibility aliases
     def send_vertex_ai_request(self, *args, **kwargs) -> str:
         return self.send_openai_request(*args, **kwargs)
 
-    def send_groq_request(self, prompt: str, requires_json: bool = False, temperature: float = 0.0) -> str:
-        return self.send_openai_request(prompt=prompt, requires_json=requires_json, temperature=temperature)
+    def send_groq_request(
+        self, 
+        prompt: str, 
+        requires_json: bool = False, 
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        return self.send_openai_request(
+            prompt=prompt, 
+            requires_json=requires_json, 
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
 
 # ============================================================================
@@ -647,7 +1016,7 @@ def load_chapter_rulings(config: TreeRLConfig, logger: logging.Logger) -> List[D
 
 
 # ============================================================================
-# SAMPLE SAVING (for debugging)
+# SAMPLE SAVING
 # ============================================================================
 
 def save_samples_for_debug(
@@ -665,7 +1034,6 @@ def save_samples_for_debug(
     filename = f"samples_epoch{epoch}_{safe_desc}_{timestamp}.json"
     filepath = os.path.join(config.samples_dir, filename)
     
-    # Prepare samples for JSON serialization
     serializable_samples = []
     for s in samples:
         sample_copy = {
@@ -675,7 +1043,8 @@ def save_samples_for_debug(
             "pred_trace": s.get("pred_trace", []),
             "gold_trace": s.get("gold_trace", []),
             "path_id": s.get("path_id", ""),
-            "leaf_reward": s.get("leaf_reward", 0),  # Fractional prefix match
+            "leaf_reward": s.get("leaf_reward", 0),
+            "reward_components": s.get("reward_components", None),
             "source": s.get("source", ""),
         }
         serializable_samples.append(sample_copy)
@@ -687,19 +1056,71 @@ def save_samples_for_debug(
     return filepath
 
 
-def display_rollout_stats(
-    samples: List[Dict],
+def save_rollouts_to_file(
+    all_samples: List[Dict],
+    filepath: str,
     logger: logging.Logger,
-) -> None:
-    """
-    Display comprehensive stats after rollout phase, before training.
+    metadata: Optional[Dict] = None,
+) -> str:
+    """Save all rollout samples to a single file."""
+    os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
     
-    Shows:
-    - Beam paths vs gold target comparisons
-    - Reward distributions
-    - Step reward statistics
-    - V(root) if available
-    """
+    serializable_samples = []
+    for s in all_samples:
+        sample_copy = {
+            "messages": s.get("messages", []),
+            "step_rewards": s.get("step_rewards", []),
+            "gold_code": s.get("gold_code", ""),
+            "pred_trace": s.get("pred_trace", []),
+            "gold_trace": s.get("gold_trace", []),
+            "path_id": s.get("path_id", ""),
+            "leaf_reward": s.get("leaf_reward", s.get("reward", 0)),
+            "reward_components": s.get("reward_components", None),
+            "source": s.get("source", ""),
+        }
+        serializable_samples.append(sample_copy)
+    
+    output = {
+        "metadata": metadata or {},
+        "timestamp": datetime.now().isoformat(),
+        "num_samples": len(serializable_samples),
+        "samples": serializable_samples,
+    }
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+    
+    logger.info(f"✓ Saved {len(serializable_samples)} rollout samples to: {filepath}")
+    return filepath
+
+
+def load_rollouts_from_file(filepath: str, logger: logging.Logger) -> List[Dict]:
+    """Load rollout samples from a previously saved file."""
+    if not os.path.exists(filepath):
+        logger.error(f"Rollouts file not found: {filepath}")
+        return []
+    
+    logger.info(f"Loading rollout samples from: {filepath}")
+    
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    if isinstance(data, list):
+        samples = data
+    else:
+        samples = data.get("samples", [])
+        metadata = data.get("metadata", {})
+        timestamp = data.get("timestamp", "unknown")
+        logger.info(f"  Loaded from: {timestamp}")
+        if metadata:
+            logger.info(f"  Metadata: {metadata}")
+    
+    logger.info(f"✓ Loaded {len(samples)} rollout samples")
+    return samples
+
+
+def display_rollout_stats(samples: List[Dict], logger: logging.Logger) -> None:
+    """Display comprehensive stats after rollout phase."""
     if not samples:
         logger.warning("No samples to display stats for")
         return
@@ -708,7 +1129,6 @@ def display_rollout_stats(
     logger.info("ROLLOUT STATISTICS (Before Training)")
     logger.info("=" * 70)
     
-    # Group samples by gold_code (ruling)
     by_ruling = {}
     for s in samples:
         gold = s.get("gold_code", "unknown")
@@ -719,9 +1139,8 @@ def display_rollout_stats(
     logger.info(f"\n📊 OVERVIEW")
     logger.info(f"  Total samples (beam paths): {len(samples)}")
     logger.info(f"  Unique rulings: {len(by_ruling)}")
-    logger.info(f"  Avg paths per ruling: {len(samples) / len(by_ruling):.1f}")
+    logger.info(f"  Avg paths per ruling: {len(samples) / max(len(by_ruling), 1):.1f}")
     
-    # Collect all rewards and step rewards
     all_leaf_rewards = []
     all_step_R = []
     perfect_count = 0
@@ -742,79 +1161,27 @@ def display_rollout_stats(
         for sr in s.get("step_rewards", []):
             all_step_R.append(sr.get("R", 0))
     
-    # Leaf reward stats
     logger.info(f"\n🎯 LEAF REWARDS (Prefix Match with Gold)")
-    logger.info(f"  Perfect (=1.0): {perfect_count} ({100*perfect_count/len(samples):.1f}%)")
-    logger.info(f"  Partial (0<r<1): {partial_count} ({100*partial_count/len(samples):.1f}%)")
-    logger.info(f"  Zero (=0): {zero_count} ({100*zero_count/len(samples):.1f}%)")
+    logger.info(f"  Perfect (=1.0): {perfect_count} ({100*perfect_count/max(len(samples), 1):.1f}%)")
+    logger.info(f"  Partial (0<r<1): {partial_count} ({100*partial_count/max(len(samples), 1):.1f}%)")
+    logger.info(f"  Zero (=0): {zero_count} ({100*zero_count/max(len(samples), 1):.1f}%)")
     if all_leaf_rewards:
         logger.info(f"  Min: {min(all_leaf_rewards):.3f}")
         logger.info(f"  Max: {max(all_leaf_rewards):.3f}")
         logger.info(f"  Mean: {sum(all_leaf_rewards)/len(all_leaf_rewards):.3f}")
     
-    # Step reward stats
-    logger.info(f"\n📈 STEP REWARDS R(s) (TreeRL Process Supervision)")
+    logger.info(f"\n📈 STEP REWARDS R(s)")
     if all_step_R:
         logger.info(f"  Count: {len(all_step_R)}")
         logger.info(f"  Min: {min(all_step_R):.4f}")
         logger.info(f"  Max: {max(all_step_R):.4f}")
         logger.info(f"  Mean: {sum(all_step_R)/len(all_step_R):.4f}")
-        neg_count = sum(1 for r in all_step_R if r < 0)
-        pos_count = sum(1 for r in all_step_R if r >= 0)
-        logger.info(f"  Negative: {neg_count} ({100*neg_count/len(all_step_R):.1f}%)")
-        logger.info(f"  Positive: {pos_count} ({100*pos_count/len(all_step_R):.1f}%)")
-    
-    # Per-ruling breakdown (show first few)
-    logger.info(f"\n🔍 BEAM PATHS vs GOLD (per ruling)")
-    logger.info("-" * 70)
-    
-    for i, (gold_code, ruling_samples) in enumerate(list(by_ruling.items())[:10]):
-        # Get gold trace
-        gold_trace = ruling_samples[0].get("gold_trace", [])
-        gold_path = " > ".join([
-            t.get("code", f"grp:{t.get('node_id', '?')}")[:8] 
-            for t in gold_trace
-        ])
-        
-        # Find best prediction
-        best_sample = max(ruling_samples, key=lambda s: s.get("leaf_reward", s.get("reward", 0)))
-        best_reward = best_sample.get("leaf_reward", best_sample.get("reward", 0))
-        pred_trace = best_sample.get("pred_trace", [])
-        pred_path = " > ".join([
-            t.get("code", f"grp:{t.get('node_id', '?')}")[:8]
-            for t in pred_trace
-        ])
-        
-        # Count matches at each level
-        match_depth = 0
-        for j, (g, p) in enumerate(zip(gold_trace, pred_trace)):
-            g_key = g.get("code") or g.get("node_id")
-            p_key = p.get("code") or p.get("node_id")
-            if str(g_key) == str(p_key):
-                match_depth = j + 1
-            else:
-                break
-        
-        status = "✓ PERFECT" if best_reward == 1.0 else (f"◐ {match_depth}/{len(gold_trace)}" if best_reward > 0 else "✗ MISS")
-        
-        logger.info(f"\n  [{i+1}] Gold: {gold_code}")
-        logger.info(f"      Gold path:  {gold_path}")
-        logger.info(f"      Best pred:  {pred_path}")
-        logger.info(f"      Best leaf_r: {best_reward:.3f} | Paths: {len(ruling_samples)} | {status}")
-        
-        # Show step rewards for best path
-        step_Rs = [f"{sr.get('R', 0):.2f}" for sr in best_sample.get("step_rewards", [])]
-        if step_Rs:
-            logger.info(f"      Step R(s): [{', '.join(step_Rs)}]")
-    
-    if len(by_ruling) > 10:
-        logger.info(f"\n  ... and {len(by_ruling) - 10} more rulings")
     
     logger.info("\n" + "=" * 70)
 
 
 # ============================================================================
-# ONLINE ROLLOUT (vLLM phase)
+# ONLINE ROLLOUT
 # ============================================================================
 
 def run_online_rollout(
@@ -833,6 +1200,41 @@ def run_online_rollout(
     except ImportError as e:
         logger.error(f"Could not import TreeRL components: {e}")
         return []
+
+    def _code_digits_prefix_reward(pred_trace: List[Dict[str, Any]], gold_code: str) -> float:
+        from api.treerl_gold_trace import normalize_code
+
+        gold_digits = normalize_code(gold_code)
+        if not gold_digits:
+            return 0.0
+
+        pred_digits = ""
+        for step in reversed(pred_trace or []):
+            if step.get("kind") == "code":
+                pred_digits = normalize_code(step.get("code", ""))
+                if pred_digits:
+                    break
+
+        if not pred_digits:
+            return 0.0
+
+        m = 0
+        for a, b in zip(pred_digits, gold_digits):
+            if a == b:
+                m += 1
+            else:
+                break
+        return m / max(len(gold_digits), 1)
+
+    def _aggregate_leaf_reward(components: Dict[str, float]) -> float:
+        w = list(config.leaf_reward_weights or ())
+        if len(w) < 2:
+            w = [1.0, 0.0]
+        w = w[:2]
+        r = (w[0] * float(components.get("trace_prefix", 0.0))) + (w[1] * float(components.get("code_digits_prefix", 0.0)))
+        if config.leaf_reward_clip_0_1:
+            r = max(0.0, min(1.0, r))
+        return r
     
     os.environ["TREERL_BEAM_SIZE"] = str(config.beam_size)
     os.environ["TREERL_CHAPTER_BEAM_SIZE"] = str(config.beam_size)
@@ -906,12 +1308,17 @@ def run_online_rollout(
                 continue
             
             pred_trace = build_pred_trace_from_path(classification_path)
-            reward = compute_leaf_reward(pred_trace, gold_trace)
+            reward_components = {
+                "trace_prefix": compute_leaf_reward(pred_trace, gold_trace),
+                "code_digits_prefix": _code_digits_prefix_reward(pred_trace, gold_code),
+            }
+            reward = _aggregate_leaf_reward(reward_components)
             
             leaves.append({
                 "path_id": path_id,
                 "pred_trace": pred_trace,
                 "reward": reward,
+                "reward_components": reward_components,
                 "trajectory": trajectory,
                 "classification_path": classification_path,
                 "source": "final_beam",
@@ -924,12 +1331,17 @@ def run_online_rollout(
             path_id = pruned.get("path_id", "unknown")
             
             pred_trace = build_pred_trace_from_path(classification_path)
-            reward = compute_leaf_reward(pred_trace, gold_trace)
+            reward_components = {
+                "trace_prefix": compute_leaf_reward(pred_trace, gold_trace),
+                "code_digits_prefix": _code_digits_prefix_reward(pred_trace, gold_code),
+            }
+            reward = _aggregate_leaf_reward(reward_components)
             
             leaves.append({
                 "path_id": path_id,
                 "pred_trace": pred_trace,
                 "reward": reward,
+                "reward_components": reward_components,
                 "trajectory": trajectory,
                 "classification_path": classification_path,
                 "source": "pruned",
@@ -960,92 +1372,217 @@ def run_online_rollout(
 
 
 # ============================================================================
-# TRAINING FUNCTIONS (Unsloth phase)
+# TRAINING FUNCTIONS (Unsloth phase + ADAPTER MERGING)
 # ============================================================================
 
-def load_training_model(config: TreeRLConfig, logger: logging.Logger, adapter_path: Optional[str] = None):
-    """Load model with Unsloth for training."""
+def load_training_model(
+    config: TreeRLConfig, 
+    logger: logging.Logger, 
+    model_path: Optional[str] = None,
+    load_adapter_from: Optional[str] = None,
+):
+    """
+    Load model with Unsloth for training.
+    
+    Args:
+        config: Training configuration
+        logger: Logger instance
+        model_path: Path to the model to load (merged model or base)
+        load_adapter_from: Path to load adapter weights from (for resuming)
+    """
     logger.info("=" * 70)
-    logger.info("LOADING TRAINING MODEL WITH UNSLOTH")
+    logger.info("LOADING NEMOTRON-3-NANO WITH UNSLOTH (Training Mode)")
     logger.info("=" * 70)
     
     from unsloth import FastLanguageModel
     
-    # Determine which adapter to load
-    load_adapter = adapter_path or config.sft_adapter
+    train_load_seq = config.train_max_seq_length
     
-    if load_adapter:
-        logger.info(f"Loading model with adapter: {load_adapter}")
-        
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=load_adapter,
-            max_seq_length=config.max_seq_length,
-            load_in_4bit=config.load_in_4bit,
-            trust_remote_code=True,
-            # offload_embedding=True,  # Disabled - causes device mismatch errors
-            # unsloth_tiled_mlp=True,  # Disabled - incompatible with Nemotron-H MLP
-        )
-        logger.info(f"Model + adapter loaded (4bit={config.load_in_4bit})")
-        
-        # Enable Unsloth gradient checkpointing for memory efficiency
-        # This offloads activations to CPU RAM, enabling 10x longer contexts
-        FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
-        logger.info("Enabled Unsloth gradient checkpointing (activation offloading)")
-        
-        # Ensure LoRA params are trainable (should already be, but explicit is safer)
-        lora_param_count = 0
-        for name, param in model.named_parameters():
-            if "lora" in name.lower():
-                param.requires_grad = True
-                lora_param_count += 1
-        logger.debug(f"Set requires_grad=True for {lora_param_count} LoRA parameters")
-        
-    else:
-        logger.info("Loading base model and creating fresh LoRA adapters")
-        
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=config.base_model,
-            max_seq_length=config.max_seq_length,
-            load_in_4bit=config.load_in_4bit,
-            trust_remote_code=True,
-            # offload_embedding=True,  # Disabled - causes device mismatch errors
-            # unsloth_tiled_mlp=True,  # Disabled - incompatible with Nemotron-H MLP
-        )
-        
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=config.lora_rank,
-            target_modules=list(config.lora_target_modules),
-            lora_alpha=config.lora_alpha,
-            lora_dropout=0.0,
-            bias="none",
-            use_gradient_checkpointing="unsloth",  # Offloads activations to CPU
-            random_state=3407,
-        )
-        logger.info(f"Fresh LoRA adapters added (rank={config.lora_rank}, 4bit={config.load_in_4bit})")
+    # Use provided model path, or the base model
+    train_model_name = model_path or config.base_model
+    
+    logger.info(f"Loading training model: {train_model_name}")
+    logger.info(f"  seq_length={train_load_seq}, 4bit={config.load_in_4bit}")
+    logger.info(f"  fast_inference=False (external vLLM architecture)")
+    
+    t0 = time.time()
+    logger.info("  Calling FastLanguageModel.from_pretrained()...")
+    sys.stdout.flush()
+    
+    # Load model WITHOUT fast_inference
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=train_model_name,
+        max_seq_length=train_load_seq,
+        dtype=None,  # Auto-detect
+        load_in_4bit=config.load_in_4bit,
+        trust_remote_code=True,  # Required for Nemotron
+    )
+    
+    logger.info(f"  ✓ Base model loaded in {time.time() - t0:.1f}s")
+    
+    # Attach LoRA
+    logger.info("  Attaching LoRA modules with Unsloth...")
+    t0 = time.time()
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=config.lora_rank,
+        target_modules=list(config.lora_target_modules),
+        lora_alpha=config.lora_alpha,
+        lora_dropout=0.0,
+        bias="none",
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
+    )
+    logger.info(f"  ✓ LoRA attached in {time.time() - t0:.1f}s (rank={config.lora_rank}, alpha={config.lora_alpha})")
+    
+    # If resuming from adapter weights
+    if load_adapter_from and os.path.isdir(load_adapter_from):
+        adapter_config_path = os.path.join(load_adapter_from, "adapter_config.json")
+        if os.path.exists(adapter_config_path):
+            logger.info(f"  Loading adapter weights from: {load_adapter_from}")
+            t0 = time.time()
+            
+            try:
+                from peft import set_peft_model_state_dict
+                
+                adapter_weights_path = os.path.join(load_adapter_from, "adapter_model.safetensors")
+                if os.path.exists(adapter_weights_path):
+                    from safetensors.torch import load_file
+                    adapter_weights = load_file(adapter_weights_path)
+                else:
+                    adapter_weights_path = os.path.join(load_adapter_from, "adapter_model.bin")
+                    adapter_weights = torch.load(adapter_weights_path, map_location="cpu", weights_only=True)
+                
+                set_peft_model_state_dict(model, adapter_weights)
+                logger.info(f"  ✓ Adapter weights loaded in {time.time() - t0:.1f}s")
+                
+            except Exception as e:
+                logger.warning(f"  Failed to load adapter weights: {e}")
+    
+    # Enable training mode
+    FastLanguageModel.for_training(model, use_gradient_checkpointing=True)
     
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    # Print trainable parameters
+    if hasattr(model, 'print_trainable_parameters'):
+        model.print_trainable_parameters()
+    else:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        logger.info(f"Trainable params: {trainable:,} ({100*trainable/total:.2f}%)")
     
-    # Log GPU memory usage
     if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1e9
-        reserved = torch.cuda.memory_reserved() / 1e9
-        logger.info(f"GPU memory after model load: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved")
+        alloc = torch.cuda.memory_allocated() / 1e9
+        free = torch.cuda.mem_get_info()[0] / 1e9
+        logger.info(f"GPU: {alloc:.1f}GB used, {free:.1f}GB free")
+    
+    logger.info("✓ Training model ready (Nemotron-3-Nano + Unsloth)")
     
     return model, tokenizer
+
+
+def merge_and_save_model(
+    model,
+    tokenizer,
+    output_path: str,
+    config: TreeRLConfig,
+    logger: logging.Logger,
+) -> str:
+    """
+    Merge LoRA adapter into base model and save for vLLM.
+    
+    CRITICAL: This is required because Nemotron doesn't support vLLM LoRA.
+    After training, we merge the adapter and save a full model for inference.
+    """
+    logger.info("=" * 70)
+    logger.info("MERGING LORA ADAPTER INTO BASE MODEL")
+    logger.info("=" * 70)
+    
+    from unsloth import FastLanguageModel
+    
+    t0 = time.time()
+    
+    # Create output directory
+    os.makedirs(output_path, exist_ok=True)
+    
+    logger.info(f"  Merging adapter and saving to: {output_path}")
+    
+    # Use Unsloth's save_pretrained_merged for efficient merging
+    # This merges the LoRA weights into the base model
+    try:
+        model.save_pretrained_merged(
+            output_path,
+            tokenizer,
+            save_method="merged_16bit",  # Save as 16-bit for vLLM
+        )
+        logger.info(f"  ✓ Model merged and saved in {time.time() - t0:.1f}s")
+        
+    except AttributeError:
+        # Fallback: manual merge if save_pretrained_merged not available
+        logger.info("  Using manual merge method...")
+        
+        # Merge LoRA into base model
+        merged_model = model.merge_and_unload()
+        
+        # Save merged model
+        merged_model.save_pretrained(output_path)
+        tokenizer.save_pretrained(output_path)
+        
+        logger.info(f"  ✓ Model merged and saved (manual) in {time.time() - t0:.1f}s")
+        
+        del merged_model
+    
+    # Verify the saved model
+    expected_files = ["config.json", "model.safetensors"]
+    found_files = os.listdir(output_path)
+    
+    has_config = "config.json" in found_files
+    has_weights = any("model" in f and (".safetensors" in f or ".bin" in f) for f in found_files)
+    
+    if has_config and has_weights:
+        logger.info(f"  ✓ Merged model verified at: {output_path}")
+    else:
+        logger.warning(f"  ⚠️ Merged model may be incomplete. Found: {found_files[:10]}")
+    
+    return output_path
 
 
 def unload_training_model(model, tokenizer, logger: logging.Logger):
     """Unload training model and free GPU memory."""
     logger.info("Unloading training model...")
+    
+    try:
+        model.cpu()
+    except Exception:
+        pass
+    
     del model
+    gc.collect()
+    gc.collect()
+    
     del tokenizer
-    free_gpu_memory()
+    gc.collect()
+    
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.reset_accumulated_memory_stats()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    
+    for _ in range(5):
+        gc.collect()
+    
+    free_gpu_memory(logger)
+    time.sleep(3)
+    
     logger.info("Training model unloaded, GPU memory freed")
 
 
@@ -1084,24 +1621,12 @@ def find_assistant_turn_boundaries(
 
 
 def _get_path_depth(user_content: str) -> int:
-    """
-    Extract tree depth from path_so_far in a rank_candidates user message.
-    
-    path_so_far looks like: "84 - Chapter desc > 8481 - Heading desc > 8481.80 - Subheading"
-    Depth = number of '>' separators + 1 (for the chapter)
-    
-    Returns:
-        Depth in the tree (1 = at chapter, selecting heading, 2 = at heading, etc.)
-        Returns -1 if path_so_far not found.
-    """
-    import re
-    # Find path_so_far in JSON
+    """Extract tree depth from path_so_far in a rank_candidates user message."""
     match = re.search(r'"path_so_far":\s*"([^"]+)"', user_content)
     if not match:
         return -1
     
     path = match.group(1)
-    # Count '>' separators - each one represents a level traversed
     depth = path.count(' > ') + 1
     return depth
 
@@ -1114,39 +1639,15 @@ def build_token_weights(
     leaf_reward: Optional[float] = None,
     messages: Optional[List[Dict]] = None,
 ) -> torch.Tensor:
-    """
-    Build per-token weight tensor from step rewards.
-    
-    TreeRL process supervision: Maps classification step rewards to assistant turns.
-    
-    Mapping logic:
-    - select_chapters_stage1/stage2 responses → step 0 (chapter selection)
-    - rank_candidates responses → step based on tree depth from path_so_far
-    - Q&A responses → weight 0 (excluded from training gradient)
-    
-    This correctly handles:
-    - Re-selections at the same level after Q&A (same step reward)
-    - Group nodes in the trace (included in step count)
-    - Q&A turns are NOT trained on (weight = 0)
-    
-    Args:
-        step_rewards: List of {step, R, trace_prefix, ...} from process supervision
-        boundaries: Token boundaries for each assistant turn
-        seq_len: Total sequence length
-        device: Device for tensor
-        leaf_reward: Fallback reward for edge cases
-        messages: Full message list to identify turn types and tree depth
-    """
+    """Build per-token weight tensor from step rewards."""
     weights = torch.zeros(seq_len, device=device)
     
     if not boundaries:
         return weights
     
-    # Build step index to R mapping
     step_to_R = {sr["step"]: sr["R"] for sr in step_rewards}
     max_step = max(step_to_R.keys()) if step_to_R else 0
     
-    # Compute fallback reward for non-classification turns
     if leaf_reward is not None:
         fallback_R = leaf_reward
     elif step_rewards:
@@ -1154,31 +1655,26 @@ def build_token_weights(
     else:
         fallback_R = 0.0
     
-    # If we don't have messages, use simple sequential mapping
     if not messages:
         for bound_idx, (start, end) in enumerate(boundaries):
             R = step_to_R.get(bound_idx, fallback_R)
             weights[start:end] = R
         return weights
     
-    # Build mapping from message index to (assistant_turn_idx, step_idx)
-    # We need to look at USER messages to get path_so_far for depth
-    assistant_step_map = []  # List of step indices for each assistant turn
-    current_depth = 0  # Track tree depth from user prompts
+    assistant_step_map = []
+    current_depth = 0
     
     for i, msg in enumerate(messages):
         role = msg.get("role", "")
         content = msg.get("content", "")
         
         if role == "user":
-            # Check if this is a rank_candidates prompt with path_so_far
             if "rank_candidates" in content:
                 depth = _get_path_depth(content)
                 if depth > 0:
                     current_depth = depth
         
         elif role == "assistant":
-            # Identify turn type
             is_chapter_selection = (
                 '"chapters"' in content or 
                 '"top_selection"' in content or
@@ -1187,34 +1683,21 @@ def build_token_weights(
             is_rank_candidates = '"primary_selection"' in content and not is_chapter_selection
             
             if is_chapter_selection:
-                # Chapter selection stages all get step 0
                 assistant_step_map.append(0)
             elif is_rank_candidates:
-                # Use current_depth from preceding user message
-                # Depth 1 = selecting at chapter level = step 1
-                # Depth 2 = selecting at heading level = step 2
-                # etc.
-                step_idx = current_depth
-                # Clamp to valid range
-                step_idx = min(step_idx, max_step)
+                step_idx = min(current_depth, max_step)
                 assistant_step_map.append(step_idx)
             else:
-                # Q&A or other - mark as -1 to use fallback
                 assistant_step_map.append(-1)
     
-    # Apply weights to token boundaries
-    # Q&A turns (step_idx == -1) get weight 0 - excluded from training
     for bound_idx, (start, end) in enumerate(boundaries):
         if bound_idx < len(assistant_step_map):
             step_idx = assistant_step_map[bound_idx]
             if step_idx >= 0:
-                # Classification decision - use step reward
                 R = step_to_R.get(step_idx, fallback_R)
             else:
-                # Q&A turn - exclude from training (weight = 0)
                 R = 0.0
         else:
-            # Extra boundaries without messages - use fallback
             R = fallback_R
         
         weights[start:end] = R
@@ -1287,22 +1770,26 @@ def train_on_samples(
     samples: List[Dict],
     config: TreeRLConfig,
     logger: logging.Logger,
+    base_model_path: str,
     adapter_path: Optional[str] = None,
-) -> Tuple[str, Optional[str], Dict[str, float]]:
+) -> Tuple[str, Dict[str, float]]:
     """
-    Train on collected samples using Unsloth.
-    
-    Uses microbatch size of 1 with gradient accumulation to avoid OOM.
+    Train on collected samples and merge adapter into model.
     
     Returns:
-        (new_adapter_path, merged_model_path, metrics)
+        (merged_model_path, metrics)
     """
     logger.info(f"Training on {len(samples)} samples...")
     logger.info(f"  Train max seq length: {config.train_max_seq_length}")
     logger.info(f"  Gradient accumulation: {config.gradient_accumulation_steps}")
     
     # Load training model
-    model, tokenizer = load_training_model(config, logger, adapter_path)
+    model, tokenizer = load_training_model(
+        config, 
+        logger, 
+        model_path=base_model_path,
+        load_adapter_from=adapter_path,
+    )
     
     # Setup optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -1313,11 +1800,15 @@ def train_on_samples(
     )
     
     model.train()
+
+    # Compute advantages
+    adv_by_path_id = _compute_leaf_advantages(samples, config, logger)
     
     metrics = {
         "total_loss": 0.0,
         "num_samples": 0,
-        "skipped_too_long": 0,
+        "skipped_truncated": 0,
+        "skipped_error": 0,
     }
     
     accumulated_loss = 0.0
@@ -1328,156 +1819,38 @@ def train_on_samples(
         messages = sample.get("messages", [])
         step_rewards = sample.get("step_rewards", [])
         leaf_reward = sample.get("leaf_reward", sample.get("reward", None))
+        path_id = sample.get("path_id", f"idx_{sample_idx}")
+        leaf_advantage = float(adv_by_path_id.get(path_id, 1.0))
         
         if not messages:
             continue
         
-        def _try_tokenize(msgs: List[Dict[str, str]]):
-            text_local = tokenizer.apply_chat_template(
-                msgs,
+        try:
+            text = tokenizer.apply_chat_template(
+                messages,
                 tokenize=False,
                 add_generation_prompt=False,
             )
-            inputs_local = tokenizer(
-                text_local,
+            inputs = tokenizer(
+                text,
                 return_tensors="pt",
                 truncation=True,
                 max_length=config.train_max_seq_length,
                 padding=False,
             )
-            return text_local, inputs_local
-
-        def _slim_messages_for_training(msgs: List[Dict[str, str]]) -> List[Dict[str, str]]:
-            """
-            Reduce token count while preserving:
-            - path_so_far in rank_candidates user messages (needed for step mapping)
-            - primary_selection option_index/code in assistant messages
-            - enough structure to keep the model conditioned.
-
-            Strategy:
-            - For assistant JSON, drop large reasoning fields ('thinking', 'detailed_internal_reasoning')
-            - For user JSON INPUT blocks, keep only a minimal subset and shrink large arrays / long strings
-            - For chapter notes blocks, remove the notes payload
-            """
-            import re
-            import json as _json
-
-            def _truncate(s: str, n: int) -> str:
-                s = s or ""
-                return s if len(s) <= n else (s[:n] + "…")
-
-            slimmed: List[Dict[str, str]] = []
-            for m in msgs:
-                role = m.get("role", "")
-                content = m.get("content", "") or ""
-
-                if role == "assistant":
-                    # Strip huge reasoning fields to reduce context
-                    try:
-                        data = _json.loads(content)
-                        if isinstance(data, dict):
-                            data.pop("thinking", None)
-                            data.pop("detailed_internal_reasoning", None)
-                            # Also truncate nested reasoning strings
-                            for k in ("primary_selection", "alternative_1", "alternative_2"):
-                                if isinstance(data.get(k), dict) and "reasoning" in data[k]:
-                                    data[k]["reasoning"] = _truncate(str(data[k]["reasoning"]), 160)
-                            content = _json.dumps(data, ensure_ascii=False)
-                    except Exception:
-                        pass
-                    slimmed.append({"role": role, "content": content})
-                    continue
-
-                if role == "user":
-                    # Remove giant chapter notes payloads (stage2)
-                    if "RELEVANT NOTES" in content and "TASK: select_chapters_stage2" in content:
-                        # Keep header + JSON INPUT only
-                        json_idx = content.find("JSON INPUT:")
-                        kept = content[: json_idx + len("JSON INPUT:")] if json_idx != -1 else "TASK: select_chapters_stage2"
-                        # Keep the JSON input itself if present
-                        json_blob = content[json_idx + len("JSON INPUT:") :] if json_idx != -1 else ""
-                        content = kept + "\n{ \"notes_omitted\": true }\n" + _truncate(json_blob.strip(), 1200)
-                        slimmed.append({"role": role, "content": content})
-                        continue
-
-                    # Try to shrink JSON INPUT payloads
-                    if "JSON INPUT:" in content:
-                        head, _, tail = content.partition("JSON INPUT:")
-                        # Tail should start with JSON; try to parse the first JSON object in tail.
-                        json_start = tail.find("{")
-                        if json_start != -1:
-                            raw = tail[json_start:]
-                            try:
-                                data = _json.loads(raw)
-                                if isinstance(data, dict) and "data" in data:
-                                    task = data.get("task", "")
-                                    d = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
-                                    out = {"task": task, "data": {}}
-                                    # Keep conditioning essentials
-                                    if "product_text" in d:
-                                        out["data"]["product_text"] = _truncate(str(d.get("product_text")), 500)
-                                    if "path_so_far" in d:
-                                        # MUST keep this for step mapping
-                                        out["data"]["path_so_far"] = str(d.get("path_so_far"))
-                                    if "select_count" in d:
-                                        out["data"]["select_count"] = d.get("select_count")
-                                    # Shrink candidate lists aggressively
-                                    tree = d.get("classification_tree")
-                                    if isinstance(tree, dict) and isinstance(tree.get("children"), list):
-                                        children = tree["children"]
-                                        # Keep only small fields; cap list length
-                                        slim_children = []
-                                        for c in children[:12]:
-                                            if not isinstance(c, dict):
-                                                continue
-                                            slim_children.append({
-                                                "index": c.get("index"),
-                                                "code": c.get("code"),
-                                                "is_group": c.get("is_group"),
-                                                "node_id": c.get("node_id"),
-                                                "description": _truncate(str(c.get("description", "")), 60),
-                                            })
-                                        out["data"]["classification_tree"] = {"children": slim_children, "children_truncated": len(children) > len(slim_children)}
-                                    content = head + "JSON INPUT:\n" + _json.dumps(out, ensure_ascii=False)
-                            except Exception:
-                                pass
-
-                    # Generic trimming for very long user messages
-                    if len(content) > 6000:
-                        content = _truncate(content, 6000)
-                    slimmed.append({"role": role, "content": content})
-                    continue
-
-                # System or other: keep but trim huge blocks
-                if len(content) > 6000:
-                    content = content[:6000] + "…"
-                slimmed.append({"role": role, "content": content})
-
-            return slimmed
-
-        try:
-            _, inputs = _try_tokenize(messages)
             input_ids = inputs["input_ids"].to(config.device)
             attention_mask = inputs["attention_mask"].to(config.device)
             seq_len = input_ids.shape[1]
 
-            # If too long, slim messages and retry tokenization
-            if seq_len > config.train_max_seq_length:
-                logger.warning(f"  Sample {sample_idx}: {seq_len} tokens > {config.train_max_seq_length} — slimming trajectory...")
-                slimmed_messages = _slim_messages_for_training(messages)
-                _, inputs2 = _try_tokenize(slimmed_messages)
-                input_ids = inputs2["input_ids"].to(config.device)
-                attention_mask = inputs2["attention_mask"].to(config.device)
-                seq_len2 = input_ids.shape[1]
-                logger.warning(f"  Sample {sample_idx}: after slimming → {seq_len2} tokens")
-                messages = slimmed_messages
-                seq_len = seq_len2
-
-            if seq_len >= config.train_max_seq_length:
-                logger.debug(f"  Sample {sample_idx}: truncated to {seq_len} tokens")
+            # Skip truncated samples
+            if seq_len == config.train_max_seq_length:
+                logger.warning(f"  Sample {sample_idx}: TRUNCATED at {seq_len} tokens - SKIPPING")
+                metrics["skipped_truncated"] += 1
+                continue
 
         except Exception as e:
             logger.warning(f"Tokenization error: {e}")
+            metrics["skipped_error"] += 1
             continue
         
         boundaries = find_assistant_turn_boundaries(
@@ -1495,6 +1868,9 @@ def train_on_samples(
                 leaf_reward=leaf_reward,
                 messages=messages,
             )
+
+            if config.advantage_method and config.advantage_method.lower() != "none":
+                loss = loss * leaf_advantage
             
             scaled_loss = loss / config.gradient_accumulation_steps
             scaled_loss.backward()
@@ -1505,25 +1881,24 @@ def train_on_samples(
             metrics["total_loss"] += loss.item()
             metrics["num_samples"] += 1
             
-            # Clear intermediate tensors to free memory
             del input_ids, attention_mask, loss, scaled_loss
             
         except torch.cuda.OutOfMemoryError as e:
             logger.error(f"OOM on sample {sample_idx} (seq_len={seq_len}): {e}")
-            # Clear cache and skip this sample
             torch.cuda.empty_cache()
             optimizer.zero_grad()
             accumulated_loss = 0.0
             accumulated_steps = 0
+            metrics["skipped_error"] += 1
             continue
             
         except Exception as e:
             import traceback
             logger.error(f"Loss computation error: {e}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.debug(f"Traceback: {traceback.format_exc()}")
+            metrics["skipped_error"] += 1
             continue
         
-        # Clear GPU cache periodically
         if sample_idx % 4 == 0:
             torch.cuda.empty_cache()
         
@@ -1542,7 +1917,6 @@ def train_on_samples(
             accumulated_loss = 0.0
             accumulated_steps = 0
             
-            # Clear cache after optimizer step
             torch.cuda.empty_cache()
     
     # Handle remaining gradients
@@ -1551,27 +1925,18 @@ def train_on_samples(
         optimizer.step()
         optimizer.zero_grad()
     
-    # Save adapter (for checkpointing/resuming)
+    # CRITICAL: Merge adapter and save full model for vLLM
     timestamp = int(time.time())
-    new_adapter_path = os.path.join(config.adapter_sync_dir, f"adapter_{timestamp}")
-    os.makedirs(new_adapter_path, exist_ok=True)
-    model.save_pretrained(new_adapter_path)
-    tokenizer.save_pretrained(new_adapter_path)
-    logger.info(f"Adapter saved to: {new_adapter_path}")
+    merged_model_path = os.path.join(config.merged_model_dir, f"merged_{timestamp}")
     
-    # Merge LoRA into base model for vLLM (Nemotron-H LoRA unsupported in vLLM)
-    merged_path = os.path.join(config.adapter_sync_dir, f"merged_{timestamp}")
-    logger.info(f"Merging LoRA weights for vLLM serving...")
-    try:
-        model.save_pretrained_merged(
-            merged_path,
-            tokenizer,
-            save_method="merged_16bit",
-        )
-        logger.info(f"Merged model saved to: {merged_path}")
-    except Exception as e:
-        logger.error(f"Failed to merge model: {e}")
-        merged_path = None
+    merge_and_save_model(model, tokenizer, merged_model_path, config, logger)
+    
+    # Also save just the adapter for potential later use
+    adapter_save_path = os.path.join(config.merged_model_dir, f"adapter_{timestamp}")
+    os.makedirs(adapter_save_path, exist_ok=True)
+    model.save_pretrained(adapter_save_path)
+    tokenizer.save_pretrained(adapter_save_path)
+    logger.info(f"LoRA adapter also saved to: {adapter_save_path}")
     
     # Compute final metrics
     if metrics["num_samples"] > 0:
@@ -1579,89 +1944,251 @@ def train_on_samples(
     else:
         metrics["avg_loss"] = 0.0
     
+    logger.info(f"  Training complete: {metrics['num_samples']} samples, "
+                f"{metrics['skipped_truncated']} truncated, {metrics['skipped_error']} errors")
+    
     # Unload model
     unload_training_model(model, tokenizer, logger)
     
-    return new_adapter_path, merged_path, metrics
+    return merged_model_path, metrics
+
+
+def _compute_leaf_advantages(
+    samples: List[Dict[str, Any]],
+    config: TreeRLConfig,
+    logger: logging.Logger,
+) -> Dict[str, float]:
+    """Compute scalar advantage per sample for GRPO/GDPO."""
+    method = (config.advantage_method or "none").lower().strip()
+    if method == "none":
+        return {s.get("path_id", f"idx_{i}"): 1.0 for i, s in enumerate(samples)}
+
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for s in samples:
+        g = s.get("gold_code", "unknown")
+        groups.setdefault(g, []).append(s)
+
+    def _std(vals: List[float]) -> float:
+        if not vals:
+            return 0.0
+        mu = sum(vals) / len(vals)
+        var = sum((v - mu) ** 2 for v in vals) / len(vals)
+        return math.sqrt(max(var, 0.0))
+
+    adv_by_path: Dict[str, float] = {}
+
+    if method in ("grpo", "grpo_no_std"):
+        for gold, gs in groups.items():
+            rs = [float(x.get("leaf_reward", x.get("reward", 0.0)) or 0.0) for x in gs]
+            mu = sum(rs) / len(rs) if rs else 0.0
+            sd = _std(rs)
+            for x in gs:
+                pid = x.get("path_id", "unknown")
+                a = float(x.get("leaf_reward", x.get("reward", 0.0)) or 0.0) - mu
+                if method == "grpo" and sd > 1e-6:
+                    a = a / (sd + 1e-4)
+                elif method == "grpo":
+                    a = 0.0
+                adv_by_path[pid] = a
+        return adv_by_path
+
+    if method == "gdpo":
+        w = list(config.gdpo_reward_weights or ())
+        if len(w) < 2:
+            w = [1.0, 1.0]
+        w = w[:2]
+
+        def _ensure_components(x: Dict[str, Any]) -> Dict[str, float]:
+            comps = x.get("reward_components")
+            if isinstance(comps, dict) and ("trace_prefix" in comps or "code_digits_prefix" in comps):
+                return {
+                    "trace_prefix": float(comps.get("trace_prefix", x.get("leaf_reward", x.get("reward", 0.0)) or 0.0)),
+                    "code_digits_prefix": float(comps.get("code_digits_prefix", 0.0) or 0.0),
+                }
+            return {
+                "trace_prefix": float(x.get("leaf_reward", x.get("reward", 0.0)) or 0.0),
+                "code_digits_prefix": 0.0,
+            }
+
+        pre_bn_adv: List[Tuple[str, float]] = []
+        for gold, gs in groups.items():
+            comp0 = [float(_ensure_components(x).get("trace_prefix", 0.0)) for x in gs]
+            comp1 = [float(_ensure_components(x).get("code_digits_prefix", 0.0)) for x in gs]
+
+            mu0 = sum(comp0) / len(comp0) if comp0 else 0.0
+            mu1 = sum(comp1) / len(comp1) if comp1 else 0.0
+            sd0 = _std(comp0)
+            sd1 = _std(comp1)
+
+            for x in gs:
+                pid = x.get("path_id", "unknown")
+                comps = _ensure_components(x)
+                r0 = float(comps.get("trace_prefix", 0.0))
+                r1 = float(comps.get("code_digits_prefix", 0.0))
+
+                a0 = (r0 - mu0) / (sd0 + 1e-4) if sd0 > 1e-6 else 0.0
+                a1 = (r1 - mu1) / (sd1 + 1e-4) if sd1 > 1e-6 else 0.0
+
+                pre = (w[0] * a0) + (w[1] * a1)
+                pre_bn_adv.append((pid, pre))
+
+        vals = [v for _, v in pre_bn_adv]
+        mu = sum(vals) / len(vals) if vals else 0.0
+        sd = _std(vals)
+        for pid, v in pre_bn_adv:
+            if sd > 1e-6:
+                adv_by_path[pid] = (v - mu) / (sd + 1e-4)
+            else:
+                adv_by_path[pid] = 0.0
+
+        if vals:
+            logger.info(
+                f"Advantage (GDPO) stats: mean={mu:.4f}, std={sd:.4f}, "
+                f"min={min(vals):.4f}, max={max(vals):.4f}"
+            )
+        return adv_by_path
+
+    logger.warning(f"Unknown advantage_method='{config.advantage_method}', defaulting to none")
+    return {s.get("path_id", f"idx_{i}"): 1.0 for i, s in enumerate(samples)}
+
+
+# ============================================================================
+# ACCURACY METRICS
+# ============================================================================
+
+def compute_batch_accuracy(samples: List[Dict], logger: logging.Logger) -> Dict[str, float]:
+    """Compute accuracy metrics for a batch of samples."""
+    if not samples:
+        return {
+            "exact_match_rate": 0.0,
+            "avg_best_reward": 0.0,
+            "avg_reward": 0.0,
+            "num_rulings": 0,
+            "num_exact_matches": 0,
+        }
+    
+    by_ruling: Dict[str, List[Dict]] = {}
+    for s in samples:
+        gold = s.get("gold_code", "unknown")
+        by_ruling.setdefault(gold, []).append(s)
+    
+    num_rulings = len(by_ruling)
+    num_exact_matches = 0
+    best_rewards = []
+    all_rewards = []
+    
+    for gold_code, ruling_samples in by_ruling.items():
+        rewards = [s.get("leaf_reward", s.get("reward", 0.0)) or 0.0 for s in ruling_samples]
+        all_rewards.extend(rewards)
+        
+        best_reward = max(rewards)
+        best_rewards.append(best_reward)
+        
+        if best_reward >= 0.9999:
+            num_exact_matches += 1
+    
+    exact_match_rate = num_exact_matches / num_rulings if num_rulings > 0 else 0.0
+    avg_best_reward = sum(best_rewards) / len(best_rewards) if best_rewards else 0.0
+    avg_reward = sum(all_rewards) / len(all_rewards) if all_rewards else 0.0
+    
+    return {
+        "exact_match_rate": exact_match_rate,
+        "avg_best_reward": avg_best_reward,
+        "avg_reward": avg_reward,
+        "num_rulings": num_rulings,
+        "num_exact_matches": num_exact_matches,
+    }
+
+
+# ============================================================================
+# WANDB INTEGRATION
+# ============================================================================
+
+def init_wandb(config: TreeRLConfig, logger: logging.Logger) -> Optional[Any]:
+    """Initialize wandb if enabled."""
+    if not config.use_wandb:
+        return None
+    
+    try:
+        import wandb
+        
+        run_name = config.wandb_run_name or f"treerl-nemotron-ch{config.chapter}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity if config.wandb_entity else None,
+            name=run_name,
+            config={
+                "base_model": config.base_model,
+                "use_fp8": config.use_fp8,
+                "chapter": config.chapter,
+                "rulings_per_batch": config.rulings_per_batch,
+                "num_batches": config.num_batches,
+                "num_epochs": config.num_epochs,
+                "beam_size": config.beam_size,
+                "lora_rank": config.lora_rank,
+                "lora_alpha": config.lora_alpha,
+                "learning_rate": config.learning_rate,
+                "advantage_method": config.advantage_method,
+            },
+        )
+        logger.info(f"✓ Wandb initialized: {run_name}")
+        return wandb
+    except ImportError:
+        logger.warning("wandb not installed. Run: pip install wandb")
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to initialize wandb: {e}")
+        return None
+
+
+def log_to_wandb(wandb_run, metrics: Dict[str, float], step: int, prefix: str = ""):
+    """Log metrics to wandb."""
+    if wandb_run is None:
+        return
+    
+    try:
+        log_dict = {}
+        for k, v in metrics.items():
+            key = f"{prefix}/{k}" if prefix else k
+            log_dict[key] = v
+        wandb_run.log(log_dict, step=step)
+    except Exception:
+        pass
 
 
 # ============================================================================
 # MAIN TRAINING FUNCTION
 # ============================================================================
 
-def merge_sft_adapter(config: TreeRLConfig, logger: logging.Logger) -> Optional[str]:
-    """Pre-merge SFT adapter for initial vLLM serving.
-    
-    Caches the merged model - if it already exists, skips re-merging.
-    """
-    if not config.sft_adapter:
-        logger.info("No SFT adapter specified, using base model")
-        return None
-    
-    merged_path = os.path.join(config.adapter_sync_dir, "sft_merged")
-    
-    # Check if already merged (look for config.json as indicator)
-    merged_config = os.path.join(merged_path, "config.json")
-    if os.path.exists(merged_config):
-        logger.info(f"✓ SFT merged model already exists: {merged_path}")
-        logger.info("  (delete this folder to force re-merge)")
-        return merged_path
-    
-    logger.info(f"Pre-merging SFT adapter: {config.sft_adapter}")
-    logger.info("  (this only happens once, cached for future runs)")
-    
-    from unsloth import FastLanguageModel
-    
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config.sft_adapter,
-        max_seq_length=config.max_seq_length,
-        load_in_4bit=config.load_in_4bit,
-        trust_remote_code=True,
-    )
-    
-    logger.info(f"Merging SFT adapter to: {merged_path}")
-    
-    try:
-        model.save_pretrained_merged(
-            merged_path,
-            tokenizer,
-            save_method="merged_16bit",
-        )
-        logger.info(f"SFT merged model saved: {merged_path}")
-    except Exception as e:
-        logger.error(f"Failed to merge SFT adapter: {e}")
-        return None
-    
-    # Cleanup
-    del model, tokenizer
-    free_gpu_memory()
-    
-    return merged_path
-
-
 def train(config: TreeRLConfig):
     """
-    Main training function with batched online RL.
+    Main training function for Nemotron-3-Nano.
     
-    Flow per epoch:
-    1. Start vLLM with merged model
-    2. Run rollouts for ALL rulings in batch (collect samples)
-    3. Stop vLLM (free GPU)
-    4. Load Unsloth, train on all samples
-    5. Export LoRA adapter + merge for next vLLM cycle
-    6. Repeat
+    Key difference from Qwen3: No vLLM LoRA support, must merge after each training cycle.
     """
     
     logger = setup_logging(config)
     
     logger.info("=" * 70)
-    logger.info("TREERL GRPO TRAINING (Batched: rollout batch → train → repeat)")
+    logger.info("TREERL GRPO TRAINING with NEMOTRON-3-NANO")
     logger.info("=" * 70)
-    logger.info(f"Config: {config}")
+    logger.info(f"Base model: {config.base_model}")
+    logger.info(f"Inference model: {config.inference_model}")
+    logger.info(f"Use FP8: {config.use_fp8}")
+    logger.info(f"Thinking mode: {config.enable_thinking}")
+    logger.info(f"vLLM LoRA: {config.vllm_enable_lora} (must be False for Nemotron)")
+    logger.info(f"Max model len: {config.vllm_max_model_len}")
     
     os.makedirs(config.output_dir, exist_ok=True)
-    os.makedirs(config.adapter_sync_dir, exist_ok=True)
+    os.makedirs(config.merged_model_dir, exist_ok=True)
     os.makedirs(config.samples_dir, exist_ok=True)
+    
+    # Initialize wandb
+    wandb_run = init_wandb(config, logger)
+    
+    # Download reasoning parser
+    ensure_reasoning_parser(config, logger)
     
     # Load data
     rulings = load_chapter_rulings(config, logger)
@@ -1669,147 +2196,339 @@ def train(config: TreeRLConfig):
         logger.error(f"No rulings found for chapter {config.chapter}")
         return
     
-    # =============================================
-    # PHASE 0: PRE-MERGE SFT ADAPTER (for first rollout)
-    # =============================================
-    logger.info("\n--- Phase 0: Pre-merging SFT adapter for vLLM ---")
-    current_vllm_model = merge_sft_adapter(config, logger)
-    current_adapter_path = config.sft_adapter if config.sft_adapter else None
+    # Calculate batches
+    if config.train_all:
+        num_batches_per_epoch = math.ceil(len(rulings) / config.rulings_per_batch)
+        logger.info(f"\n📊 Training Schedule (TRAIN ALL MODE):")
+        logger.info(f"  Total rulings in chapter {config.chapter}: {len(rulings)}")
+    else:
+        num_batches_per_epoch = config.num_batches
+        logger.info(f"\n📊 Training Schedule (Random Sampling):")
+    
+    logger.info(f"  Rulings per batch: {config.rulings_per_batch}")
+    logger.info(f"  Batches per epoch: {num_batches_per_epoch}")
+    logger.info(f"  Number of epochs: {config.num_epochs}")
+    
+    # Initialize: Start with base HuggingFace model
+    # After first training, we'll use merged models
+    current_model_path = config.inference_model  # HF model path for first iteration
+    current_adapter_path = None  # No adapter initially (will be created after first train)
     
     # Initialize vLLM server manager
     vllm_manager = VLLMServerManager(config, logger)
     
     training_start = time.time()
     all_metrics = []
-    global_step = 0
+    global_batch_num = 0
+    
+    # Rolling accuracy buffer
+    accuracy_rolling_samples = []
+    accuracy_rolling_rulings_seen = set()
     
     for epoch in range(config.num_epochs):
         epoch_start = time.time()
+        epoch_samples_total = 0
+        epoch_exact_matches = 0
+        epoch_rulings_total = 0
+        
+        if config.train_all:
+            epoch_rulings_order = rulings.copy()
+            random.shuffle(epoch_rulings_order)
+            logger.info(f"\n  Shuffled {len(epoch_rulings_order)} rulings for epoch {epoch + 1}")
         
         logger.info(f"\n{'=' * 70}")
         logger.info(f"EPOCH {epoch + 1}/{config.num_epochs}")
         logger.info(f"{'=' * 70}")
         
-        # Sample rulings for this epoch
-        epoch_rulings = random.sample(
-            rulings, 
-            min(config.num_rulings_per_epoch, len(rulings))
-        )
-        
-        # =============================================
-        # PHASE 1: START VLLM WITH MERGED MODEL
-        # =============================================
-        logger.info(f"\n--- Phase 1: Starting vLLM server ---")
-        logger.info(f"  Model: {current_vllm_model or config.base_model}")
-        
-        if not vllm_manager.start_server(model_path=current_vllm_model):
-            logger.error("Failed to start vLLM server!")
-            return
-        
-        vllm_client = VLLMInferenceClient(config, logger, vllm_manager)
-        
-        # =============================================
-        # PHASE 2: RUN ROLLOUTS FOR ALL RULINGS IN BATCH
-        # =============================================
-        logger.info(f"\n--- Phase 2: Running rollouts for {len(epoch_rulings)} rulings ---")
-        
-        all_epoch_samples = []
-        
-        for ruling_idx, ruling in enumerate(epoch_rulings):
-            global_step += 1
-            product_desc = ruling.get("short_product_description", "")[:50]
+        for batch_num in range(num_batches_per_epoch):
+            global_batch_num += 1
+            batch_start = time.time()
             
-            logger.info(f"\n  Ruling {ruling_idx+1}/{len(epoch_rulings)}: {product_desc}...")
-            
-            samples = run_online_rollout(ruling, config, logger, vllm_client)
-            
-            if samples:
-                all_epoch_samples.extend(samples)
-                logger.info(f"    → Collected {len(samples)} samples (total: {len(all_epoch_samples)})")
+            logger.info(f"\n{'─' * 50}")
+            if config.train_all:
+                start_idx = batch_num * config.rulings_per_batch
+                end_idx = min(start_idx + config.rulings_per_batch, len(rulings))
+                logger.info(f"BATCH {batch_num + 1}/{num_batches_per_epoch} (Global: {global_batch_num}) | Rulings {start_idx+1}-{end_idx}/{len(rulings)}")
             else:
-                logger.warning(f"    → No samples collected")
-        
-        # =============================================
-        # PHASE 3: STOP VLLM (FREE GPU)
-        # =============================================
-        logger.info(f"\n--- Phase 3: Stopping vLLM server ---")
-        vllm_manager.stop_server()
-        
-        # =============================================
-        # DEBUG: SAVE SAMPLES + DISPLAY STATS
-        # =============================================
-        if all_epoch_samples:
-            save_samples_for_debug(
-                all_epoch_samples,
+                logger.info(f"BATCH {batch_num + 1}/{num_batches_per_epoch} (Global: {global_batch_num})")
+            logger.info(f"{'─' * 50}")
+            
+            # Log model chain
+            logger.info(f"🔗 MODEL CHAIN:")
+            logger.info(f"   Current model for vLLM: {current_model_path}")
+            if current_adapter_path:
+                logger.info(f"   Adapter to resume from: {current_adapter_path}")
+            
+            all_batch_samples = []
+            batch_rulings = []
+            
+            if config.load_rollouts:
+                logger.info(f"\n--- Loading cached rollouts (skipping vLLM) ---")
+                all_batch_samples = load_rollouts_from_file(config.load_rollouts, logger)
+                
+                if not all_batch_samples:
+                    logger.error("Failed to load rollouts from file!")
+                    return
+            else:
+                # Select rulings
+                if config.train_all:
+                    start_idx = batch_num * config.rulings_per_batch
+                    end_idx = min(start_idx + config.rulings_per_batch, len(epoch_rulings_order))
+                    batch_rulings = epoch_rulings_order[start_idx:end_idx]
+                    
+                    if not batch_rulings:
+                        logger.info(f"  No more rulings for batch {batch_num + 1}, skipping")
+                        continue
+                else:
+                    batch_rulings = random.sample(
+                        rulings, 
+                        min(config.rulings_per_batch, len(rulings))
+                    )
+                
+                # =============================================
+                # PHASE 1: START VLLM WITH CURRENT MODEL (NO LORA)
+                # =============================================
+                logger.info(f"\n--- Phase 1: Starting vLLM server (Nemotron - no LoRA) ---")
+                logger.info(f"  Model: {current_model_path}")
+                
+                if not vllm_manager.start_server(model_path=current_model_path):
+                    logger.error("Failed to start vLLM server!")
+                    return
+                
+                vllm_client = VLLMInferenceClient(config, logger, vllm_manager)
+                
+                # =============================================
+                # PHASE 2: RUN ROLLOUTS
+                # =============================================
+                logger.info(f"\n--- Phase 2: Running rollouts for {len(batch_rulings)} rulings ---")
+                
+                for ruling_idx, ruling in enumerate(batch_rulings):
+                    product_desc = ruling.get("short_product_description", "")[:50]
+                    
+                    logger.info(f"\n  Ruling {ruling_idx+1}/{len(batch_rulings)}: {product_desc}...")
+                    
+                    samples = run_online_rollout(ruling, config, logger, vllm_client)
+                    
+                    if samples:
+                        all_batch_samples.extend(samples)
+                        logger.info(f"    → Collected {len(samples)} samples (total: {len(all_batch_samples)})")
+                    else:
+                        logger.warning(f"    → No samples collected")
+                
+                # =============================================
+                # PHASE 3: STOP VLLM
+                # =============================================
+                logger.info(f"\n--- Phase 3: Stopping vLLM server ---")
+                vllm_manager.stop_server()
+                
+                # Save rollouts if requested
+                if config.save_rollouts and all_batch_samples:
+                    base, ext = os.path.splitext(config.save_rollouts)
+                    rollout_file = f"{base}_e{epoch + 1}_b{batch_num + 1}{ext}"
+                    
+                    save_rollouts_to_file(
+                        all_batch_samples,
+                        rollout_file,
+                        logger,
+                        metadata={
+                            "epoch": epoch + 1,
+                            "batch": batch_num + 1,
+                            "global_batch": global_batch_num,
+                            "num_rulings": len(batch_rulings),
+                            "chapter": config.chapter,
+                            "model": "nemotron-3-nano",
+                        }
+                    )
+            
+            # =============================================
+            # COMPUTE ACCURACY METRICS
+            # =============================================
+            for s in all_batch_samples:
+                accuracy_rolling_samples.append(s)
+            
+            current_batch_gold_codes = {s.get("gold_code") for s in all_batch_samples if s.get("gold_code")}
+            accuracy_rolling_rulings_seen.update(current_batch_gold_codes)
+            
+            # Prune rolling buffer
+            rolling_by_ruling = {}
+            for s in accuracy_rolling_samples:
+                gold = s.get("gold_code", "unknown")
+                rolling_by_ruling.setdefault(gold, []).append(s)
+            
+            unique_gold_codes = []
+            for s in accuracy_rolling_samples:
+                g = s.get("gold_code")
+                if g and g not in unique_gold_codes:
+                    unique_gold_codes.append(g)
+            
+            if len(unique_gold_codes) > config.accuracy_window_size:
+                gold_codes_to_keep = unique_gold_codes[-config.accuracy_window_size:]
+                accuracy_rolling_samples = [s for s in accuracy_rolling_samples if s.get("gold_code") in gold_codes_to_keep]
+                accuracy_rolling_rulings_seen = set(gold_codes_to_keep)
+            
+            accuracy_metrics = compute_batch_accuracy(accuracy_rolling_samples, logger)
+            
+            logger.info(f"\n📊 ROLLING ACCURACY (window={config.accuracy_window_size} rulings):")
+            logger.info(f"  Exact match rate: {accuracy_metrics['exact_match_rate']:.1%} ({accuracy_metrics['num_exact_matches']}/{accuracy_metrics['num_rulings']})")
+            logger.info(f"  Avg best reward: {accuracy_metrics['avg_best_reward']:.4f}")
+            
+            current_batch_accuracy = compute_batch_accuracy(all_batch_samples, logger)
+            
+            epoch_samples_total += len(all_batch_samples)
+            epoch_exact_matches += current_batch_accuracy['num_exact_matches']
+            epoch_rulings_total += current_batch_accuracy['num_rulings']
+            
+            # Debug output
+            if all_batch_samples:
+                save_samples_for_debug(
+                    all_batch_samples,
+                    config,
+                    logger,
+                    epoch=epoch + 1,
+                    ruling_desc=f"e{epoch+1}_b{batch_num+1}",
+                )
+                display_rollout_stats(all_batch_samples, logger)
+            
+            # =============================================
+            # PHASE 4: TRAIN AND MERGE
+            # =============================================
+            if not all_batch_samples:
+                logger.warning(f"No samples collected for batch {batch_num + 1}, skipping training")
+                continue
+            
+            logger.info(f"\n--- Phase 4: Training on {len(all_batch_samples)} samples ---")
+            
+            # Determine base model for training:
+            # - First batch: use HF base model
+            # - Subsequent batches: use previous merged model
+            if global_batch_num == 1:
+                train_base_model = config.base_model  # HF model
+                train_adapter_from = None
+            else:
+                # Use the base model but load adapter from previous iteration
+                train_base_model = config.base_model
+                train_adapter_from = current_adapter_path
+            
+            logger.info(f"  📥 Training base: {train_base_model}")
+            if train_adapter_from:
+                logger.info(f"  📥 Resume adapter: {train_adapter_from}")
+            
+            # Train and merge
+            merged_model_path, train_metrics = train_on_samples(
+                all_batch_samples,
                 config,
                 logger,
-                epoch=epoch + 1,
-                ruling_desc=f"epoch{epoch+1}_batch",
+                base_model_path=train_base_model,
+                adapter_path=train_adapter_from,
             )
-            # Display comprehensive rollout stats before training
-            display_rollout_stats(all_epoch_samples, logger)
+            
+            # Cleanup after training
+            gc.collect()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            
+            time.sleep(5)
+            free_gpu_memory(logger)
+            
+            # =============================================
+            # PHASE 5: UPDATE MODEL PATHS
+            # =============================================
+            previous_model = current_model_path
+            current_model_path = merged_model_path  # Use merged model for next vLLM
+            # Also store adapter path for potential training resume
+            current_adapter_path = os.path.join(
+                config.merged_model_dir, 
+                f"adapter_{os.path.basename(merged_model_path).replace('merged_', '')}"
+            )
+            
+            avg_loss = train_metrics.get("avg_loss", 0)
+            
+            logger.info(f"\n--- Phase 5: Model updated ---")
+            logger.info(f"  📤 Previous model: {previous_model}")
+            logger.info(f"  📥 New merged model: {merged_model_path}")
+            logger.info(f"  ✓ Next vLLM will use: {current_model_path}")
+            
+            # Record metrics
+            batch_metrics = {
+                "epoch": epoch + 1,
+                "batch": batch_num + 1,
+                "global_batch": global_batch_num,
+                "num_rulings": len(batch_rulings),
+                "num_samples": train_metrics.get("num_samples", 0),
+                "avg_loss": avg_loss,
+                "exact_match_rate": accuracy_metrics['exact_match_rate'],
+                "num_exact_matches": accuracy_metrics['num_exact_matches'],
+                "avg_best_reward": accuracy_metrics['avg_best_reward'],
+                "merged_model_path": merged_model_path,
+            }
+            all_metrics.append(batch_metrics)
+            
+            # Log to wandb
+            log_to_wandb(wandb_run, {
+                "loss": avg_loss,
+                "exact_match_rate": accuracy_metrics['exact_match_rate'],
+                "num_exact_matches": accuracy_metrics['num_exact_matches'],
+                "avg_best_reward": accuracy_metrics['avg_best_reward'],
+                "num_samples": train_metrics.get("num_samples", 0),
+            }, step=global_batch_num, prefix="batch")
+            
+            # Batch summary
+            batch_time = time.time() - batch_start
+            
+            logger.info(f"\n{'─' * 50}")
+            logger.info(f"Batch {batch_num + 1} Summary:")
+            logger.info(f"  Rulings: {len(batch_rulings)}")
+            logger.info(f"  Samples: {len(all_batch_samples)}")
+            logger.info(f"  Loss: {avg_loss:.4f}")
+            logger.info(f"  Exact match: {accuracy_metrics['exact_match_rate']:.1%}")
+            logger.info(f"  Time: {batch_time:.1f}s ({batch_time/60:.1f}m)")
+            logger.info(f"{'─' * 50}")
+            
+            # Cleanup old merged models to save disk space (keep last 3)
+            try:
+                merged_dirs = sorted([
+                    d for d in os.listdir(config.merged_model_dir) 
+                    if d.startswith("merged_") and os.path.isdir(os.path.join(config.merged_model_dir, d))
+                ])
+                if len(merged_dirs) > 3:
+                    for old_dir in merged_dirs[:-3]:
+                        old_path = os.path.join(config.merged_model_dir, old_dir)
+                        if old_path != current_model_path:
+                            shutil.rmtree(old_path, ignore_errors=True)
+                            logger.info(f"  Cleaned up old model: {old_dir}")
+            except Exception as e:
+                logger.debug(f"  Cleanup error: {e}")
         
-        # =============================================
-        # PHASE 4: TRAIN WITH UNSLOTH
-        # =============================================
-        if not all_epoch_samples:
-            logger.warning(f"No samples collected for epoch {epoch + 1}, skipping training")
-            continue
-        
-        logger.info(f"\n--- Phase 4: Training on {len(all_epoch_samples)} samples ---")
-        
-        new_adapter_path, merged_model_path, train_metrics = train_on_samples(
-            all_epoch_samples,
-            config,
-            logger,
-            adapter_path=current_adapter_path,
-        )
-        
-        # =============================================
-        # PHASE 5: UPDATE PATHS FOR NEXT CYCLE
-        # =============================================
-        current_adapter_path = new_adapter_path
-        current_vllm_model = merged_model_path
-        
-        avg_loss = train_metrics.get("avg_loss", 0)
-        
-        logger.info(f"\n--- Phase 5: Model updated ---")
-        logger.info(f"  Adapter: {new_adapter_path}")
-        logger.info(f"  Merged model: {merged_model_path}")
-        
-        # Record epoch metrics
-        all_metrics.append({
-            "epoch": epoch + 1,
-            "num_rulings": len(epoch_rulings),
-            "num_samples": train_metrics.get("num_samples", 0),
-            "avg_loss": avg_loss,
-            "adapter_path": new_adapter_path,
-            "merged_model_path": merged_model_path,
-        })
-        
-        # =============================================
-        # EPOCH COMPLETE
-        # =============================================
+        # Epoch complete
         epoch_time = time.time() - epoch_start
+        epoch_exact_match_rate = epoch_exact_matches / epoch_rulings_total if epoch_rulings_total > 0 else 0.0
         
-        logger.info(f"\n{'=' * 50}")
-        logger.info(f"Epoch {epoch + 1} Summary:")
-        logger.info(f"  Rulings processed: {len(epoch_rulings)}")
-        logger.info(f"  Total samples: {len(all_epoch_samples)}")
-        logger.info(f"  Average loss: {avg_loss:.4f}")
-        logger.info(f"  Time: {epoch_time:.1f}s ({epoch_time/60:.1f}m)")
-        logger.info(f"{'=' * 50}")
+        logger.info(f"\n{'=' * 70}")
+        logger.info(f"EPOCH {epoch + 1} COMPLETE")
+        logger.info(f"{'=' * 70}")
+        logger.info(f"  Batches: {num_batches_per_epoch}")
+        logger.info(f"  Total rulings: {epoch_rulings_total}")
+        logger.info(f"  Total samples: {epoch_samples_total}")
+        logger.info(f"  Epoch exact match rate: {epoch_exact_match_rate:.1%}")
+        logger.info(f"  Time: {epoch_time/60:.1f}m")
+        
+        log_to_wandb(wandb_run, {
+            "exact_match_rate": epoch_exact_match_rate,
+            "num_exact_matches": epoch_exact_matches,
+            "total_rulings": epoch_rulings_total,
+        }, step=global_batch_num, prefix="epoch")
         
         # Save checkpoint
-        if (epoch + 1) % config.save_every_n_epochs == 0 and current_adapter_path:
-            import shutil
+        if (epoch + 1) % config.save_every_n_epochs == 0 and current_model_path:
             checkpoint_dir = os.path.join(
                 config.output_dir, 
                 f"checkpoint-epoch-{epoch + 1}"
             )
             if os.path.exists(checkpoint_dir):
                 shutil.rmtree(checkpoint_dir)
-            shutil.copytree(current_adapter_path, checkpoint_dir)
+            shutil.copytree(current_model_path, checkpoint_dir)
             logger.info(f"  Checkpoint saved: {checkpoint_dir}")
     
     # Training complete
@@ -1818,31 +2537,33 @@ def train(config: TreeRLConfig):
     logger.info("\n" + "=" * 70)
     logger.info("TRAINING COMPLETE")
     logger.info("=" * 70)
+    logger.info(f"Total batches: {global_batch_num}")
     logger.info(f"Total time: {total_time/60:.1f} minutes")
     if all_metrics:
-        logger.info(f"Final average loss: {all_metrics[-1].get('avg_loss', 0):.4f}")
+        final_exact_match = all_metrics[-1].get('exact_match_rate', 0)
+        logger.info(f"Final batch exact match: {final_exact_match:.1%}")
+        logger.info(f"Final batch loss: {all_metrics[-1].get('avg_loss', 0):.4f}")
     
-    # Save final models
-    import shutil
-    if current_adapter_path:
-        final_adapter_dir = os.path.join(config.output_dir, "final_adapter")
-        if os.path.exists(final_adapter_dir):
-            shutil.rmtree(final_adapter_dir)
-        shutil.copytree(current_adapter_path, final_adapter_dir)
-        logger.info(f"Final adapter saved: {final_adapter_dir}")
-    
-    if current_vllm_model:
-        final_merged_dir = os.path.join(config.output_dir, "final_merged")
-        if os.path.exists(final_merged_dir):
-            shutil.rmtree(final_merged_dir)
-        shutil.copytree(current_vllm_model, final_merged_dir)
-        logger.info(f"Final merged model saved: {final_merged_dir}")
+    # Save final model
+    if current_model_path:
+        final_model_dir = os.path.join(config.output_dir, "final_model")
+        if os.path.exists(final_model_dir):
+            shutil.rmtree(final_model_dir)
+        shutil.copytree(current_model_path, final_model_dir)
+        logger.info(f"Final model saved: {final_model_dir}")
     
     # Save training metrics
     metrics_file = os.path.join(config.output_dir, "training_metrics.json")
     with open(metrics_file, 'w') as f:
         json.dump(all_metrics, f, indent=2)
     logger.info(f"Metrics saved: {metrics_file}")
+    
+    # Close wandb
+    if wandb_run is not None:
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -1850,38 +2571,39 @@ def train(config: TreeRLConfig):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="TreeRL GRPO Training (vLLM + Unsloth)")
+    parser = argparse.ArgumentParser(
+        description="TreeRL GRPO Training with Nemotron-3-Nano (External vLLM + Unsloth + Adapter Merging)"
+    )
     
     # Model args
     parser.add_argument("--base-model", type=str, 
                        default="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-                       help="Base model name or path")
-    parser.add_argument("--sft-adapter", type=str, 
-                       default="orlandowhite/nemotron3_nano_sft",
-                       help="SFT LoRA adapter to continue training from")
-    parser.add_argument("--no-sft-adapter", action="store_true",
-                       help="Train fresh LoRA from base model")
-    parser.add_argument("--max-seq-length", type=int, default=55000,
-                       help="Maximum sequence length for model loading")
-    parser.add_argument("--train-max-seq-length", type=int, default=32000,
-                       help="Maximum sequence length per training sample")
+                       help="Base model (BF16 variant)")
+    parser.add_argument("--use-fp8", action="store_true",
+                       help="Use FP8 model variant for inference")
+    parser.add_argument("--max-seq-length", type=int, default=262144,
+                       help="Max context length for vLLM (up to 1M for Nemotron)")
+    parser.add_argument("--train-max-seq-length", type=int, default=32768,
+                       help="Max sequence length per training sample")
     parser.add_argument("--no-4bit", action="store_true",
-                       help="Disable 4-bit quantization")
-    parser.add_argument("--rollout-max-new-tokens", type=int, default=2048,
-                       help="Max new tokens per generation during rollout")
+                       help="Disable 4-bit quantization for training")
+    
+    # Nemotron thinking mode
+    parser.add_argument("--no-thinking", action="store_true",
+                       help="Disable Nemotron thinking mode")
+    parser.add_argument("--no-reasoning-parser", action="store_true",
+                       help="Don't use custom Nemotron reasoning parser")
     
     # vLLM args
     parser.add_argument("--vllm-port", type=int, default=8000,
                        help="vLLM server port")
-    parser.add_argument("--vllm-max-model-len", type=int, default=55000,
-                       help="vLLM max context length")
-    parser.add_argument("--vllm-gpu-util", type=float, default=0.90,
+    parser.add_argument("--vllm-gpu-util", type=float, default=0.85,
                        help="vLLM GPU memory utilization")
     
     # LoRA args
-    parser.add_argument("--lora-rank", type=int, default=16,
+    parser.add_argument("--lora-rank", type=int, default=32,
                        help="LoRA rank")
-    parser.add_argument("--lora-alpha", type=int, default=32,
+    parser.add_argument("--lora-alpha", type=int, default=64,
                        help="LoRA alpha")
     
     # Training args
@@ -1889,17 +2611,44 @@ def main():
                        help="Learning rate")
     parser.add_argument("--grad-accum", type=int, default=4,
                        help="Gradient accumulation steps")
+    
+    # Batch/Epoch structure
+    parser.add_argument("--rulings-per-batch", type=int, default=5,
+                       help="Number of rulings per batch")
+    parser.add_argument("--accuracy-window", type=int, default=10,
+                       help="Track accuracy over the last N rulings")
+    parser.add_argument("--num-batches", type=int, default=20,
+                       help="Number of batches per epoch")
     parser.add_argument("--epochs", type=int, default=3,
                        help="Number of epochs")
+
+    # Advantage normalization
+    parser.add_argument("--advantage-method", type=str, default="gdpo",
+                       choices=["none", "grpo", "grpo_no_std", "gdpo"],
+                       help="Advantage normalization method")
+    parser.add_argument("--gdpo-reward-weights", type=str, default="1.0,1.0",
+                       help="GDPO reward component weights")
+    parser.add_argument("--leaf-reward-weights", type=str, default="0.85,0.15",
+                       help="Leaf reward aggregation weights")
     
     # Data args
     parser.add_argument("--chapter", type=str, default="84",
                        help="HTS chapter to train on")
-    parser.add_argument("--num-rulings", type=int, default=20,
-                       help="Number of rulings per epoch")
     parser.add_argument("--cross-rulings-file", type=str,
                        default="cross_rulings_dataset.json",
                        help="Path to cross rulings JSON")
+    parser.add_argument("--train-all", action="store_true",
+                       help="Train on ALL rulings in chapter")
+    
+    # Wandb args
+    parser.add_argument("--wandb", action="store_true",
+                       help="Enable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="treerl-grpo-nemotron",
+                       help="Wandb project name")
+    parser.add_argument("--wandb-run-name", type=str, default="",
+                       help="Wandb run name")
+    parser.add_argument("--wandb-entity", type=str, default="",
+                       help="Wandb entity")
     
     # TreeRL args
     parser.add_argument("--beam-size", type=int, default=4,
@@ -1908,34 +2657,58 @@ def main():
                        help="Max Q&A turns per rollout")
     
     # Output args
-    parser.add_argument("--output-dir", type=str, default="treerl_checkpoints",
-                       help="Output directory for checkpoints")
+    parser.add_argument("--output-dir", type=str, default="treerl_checkpoints_nemotron",
+                       help="Output directory")
+    
+    # Rollout caching
+    parser.add_argument("--save-rollouts", type=str, default="",
+                       help="Save rollout samples to file")
+    parser.add_argument("--load-rollouts", type=str, default="",
+                       help="Load rollout samples from file")
     
     args = parser.parse_args()
     
-    sft_adapter = args.sft_adapter if not args.no_sft_adapter else ""
-    
+    # Build config
     config = TreeRLConfig(
         base_model=args.base_model,
-        sft_adapter=sft_adapter,
+        use_fp8=args.use_fp8,
         max_seq_length=args.max_seq_length,
+        vllm_max_model_len=args.max_seq_length,
         train_max_seq_length=args.train_max_seq_length,
         load_in_4bit=not args.no_4bit,
-        rollout_max_new_tokens=args.rollout_max_new_tokens,
+        enable_thinking=not args.no_thinking,
+        use_reasoning_parser=not args.no_reasoning_parser,
         vllm_port=args.vllm_port,
-        vllm_max_model_len=args.vllm_max_model_len,
         vllm_gpu_memory_utilization=args.vllm_gpu_util,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         learning_rate=args.lr,
         gradient_accumulation_steps=args.grad_accum,
+        rulings_per_batch=args.rulings_per_batch,
+        accuracy_window_size=args.accuracy_window,
+        num_batches=args.num_batches,
         num_epochs=args.epochs,
+        advantage_method=args.advantage_method,
+        gdpo_reward_weights=tuple(float(x.strip()) for x in args.gdpo_reward_weights.split(",") if x.strip()),
+        leaf_reward_weights=tuple(float(x.strip()) for x in args.leaf_reward_weights.split(",") if x.strip()),
         chapter=args.chapter,
-        num_rulings_per_epoch=args.num_rulings,
         cross_rulings_file=args.cross_rulings_file,
+        train_all=args.train_all,
         beam_size=args.beam_size,
         max_questions=args.max_questions,
         output_dir=args.output_dir,
+        merged_model_dir=os.path.join(args.output_dir, "merged_models"),
+        samples_dir=os.path.join(args.output_dir, "samples"),
+        completions_log=os.path.join(args.output_dir, "completions.jsonl"),
+        save_rollouts=args.save_rollouts,
+        load_rollouts=args.load_rollouts,
+        use_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_entity=args.wandb_entity,
+        # CRITICAL: External vLLM architecture
+        use_fast_inference=False,
+        vllm_enable_lora=False,  # Nemotron doesn't support vLLM LoRA
     )
     
     train(config)

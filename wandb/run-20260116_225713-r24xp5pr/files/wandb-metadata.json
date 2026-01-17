@@ -1,0 +1,43 @@
+{
+  "os": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+  "python": "CPython 3.12.3",
+  "startedAt": "2026-01-16T22:57:13.718366Z",
+  "args": [
+    "--chapter",
+    "84",
+    "--sft-adapter",
+    "orlandowhite/nemotron3_nano_sft",
+    "--parallel-rollouts",
+    "4",
+    "--rulings-per-batch",
+    "5",
+    "--num-batches",
+    "20",
+    "--epochs",
+    "3",
+    "--wandb"
+  ],
+  "program": "/home/orlando/uni/nemotron_train.py",
+  "codePath": "nemotron_train.py",
+  "codePathLocal": "nemotron_train.py",
+  "git": {
+    "remote": "https://github.com/OrlandoWhite88/uni.git",
+    "commit": "e3e54e246d3e978e7bd905a42c3ad9740c7b6e73"
+  },
+  "email": "Orlando.white@outlook.com",
+  "root": "/home/orlando/uni",
+  "host": "DESKTOP-VMIE7MQ",
+  "executable": "/usr/bin/python3",
+  "cpu_count": 16,
+  "cpu_count_logical": 32,
+  "disk": {
+    "/": {
+      "total": "1081101176832",
+      "used": "174862827520"
+    }
+  },
+  "memory": {
+    "total": "33516806144"
+  },
+  "writerId": "mqei0z28mq1r728athe5fwakr92obd56"
+}

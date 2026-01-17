@@ -1,0 +1,198 @@
+_wandb:
+    value:
+        cli_version: 0.23.0
+        e:
+            mqei0z28mq1r728athe5fwakr92obd56:
+                args:
+                    - --chapter
+                    - "84"
+                    - --sft-adapter
+                    - orlandowhite/nemotron3_nano_sft
+                    - --parallel-rollouts
+                    - "4"
+                    - --rulings-per-batch
+                    - "5"
+                    - --num-batches
+                    - "20"
+                    - --epochs
+                    - "3"
+                    - --wandb
+                codePath: nemotron_train.py
+                codePathLocal: nemotron_train.py
+                cpu_count: 16
+                cpu_count_logical: 32
+                disk:
+                    /:
+                        total: "1081101176832"
+                        used: "174862827520"
+                email: Orlando.white@outlook.com
+                executable: /usr/bin/python3
+                git:
+                    commit: e3e54e246d3e978e7bd905a42c3ad9740c7b6e73
+                    remote: https://github.com/OrlandoWhite88/uni.git
+                host: DESKTOP-VMIE7MQ
+                memory:
+                    total: "33516806144"
+                os: Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39
+                program: /home/orlando/uni/nemotron_train.py
+                python: CPython 3.12.3
+                root: /home/orlando/uni
+                startedAt: "2026-01-16T22:57:13.718366Z"
+                writerId: mqei0z28mq1r728athe5fwakr92obd56
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+                - 49
+                - 95
+            "3":
+                - 2
+                - 13
+                - 16
+                - 61
+            "4": 3.12.3
+            "5": 0.23.0
+            "12": 0.23.0
+            "13": linux-x86_64
+accuracy_window_size:
+    value: 10
+adapter_sync_dir:
+    value: treerl_checkpoints/adapter_sync
+advantage_method:
+    value: gdpo
+base_model_bf16:
+    value: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+base_model_fp8:
+    value: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
+beam_size:
+    value: 4
+benchmark_every_n_batches:
+    value: 0
+benchmark_num_rulings:
+    value: 50
+chapter:
+    value: "84"
+completions_log:
+    value: treerl_checkpoints/completions.jsonl
+cross_rulings_file:
+    value: cross_rulings_dataset.json
+device:
+    value: cuda
+enable_thinking:
+    value: true
+gdpo_reward_weights:
+    value:
+        - 1
+        - 1
+gradient_accumulation_steps:
+    value: 4
+inference_dtype:
+    value: bf16
+leaf_reward_clip_0_1:
+    value: true
+leaf_reward_weights:
+    value:
+        - 0.85
+        - 0.15
+learning_rate:
+    value: 5e-05
+load_in_4bit:
+    value: true
+load_rollouts:
+    value: ""
+log_every_n_steps:
+    value: 1
+log_file:
+    value: treerl_checkpoints/treerl_training.log
+lora_alpha:
+    value: 64
+lora_rank:
+    value: 32
+lora_target_modules:
+    value:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+max_grad_norm:
+    value: 1
+max_questions:
+    value: 3
+merged_models_dir:
+    value: treerl_checkpoints/merged_models
+num_batches:
+    value: 20
+num_epochs:
+    value: 3
+output_dir:
+    value: treerl_checkpoints
+parallel_rollouts:
+    value: 4
+rollout_max_new_tokens_cap:
+    value: 16384
+rollout_temperature:
+    value: 0.6
+rollout_top_p:
+    value: 0.95
+rulings_per_batch:
+    value: 5
+samples_dir:
+    value: treerl_checkpoints/samples
+save_every_n_epochs:
+    value: 1
+save_rollouts:
+    value: ""
+sft_adapter:
+    value: orlandowhite/nemotron3_nano_sft
+start_batch:
+    value: 0
+token_safety_margin:
+    value: 512
+train_all:
+    value: false
+train_max_seq_length:
+    value: 65536
+train_model:
+    value: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+use_fast_inference:
+    value: false
+use_wandb:
+    value: true
+vllm_enable_auto_tool_choice:
+    value: true
+vllm_host:
+    value: 127.0.0.1
+vllm_max_model_len:
+    value: 262144
+vllm_max_num_seqs:
+    value: 8
+vllm_port:
+    value: 8000
+vllm_reasoning_parser_name:
+    value: nano_v3
+vllm_reasoning_parser_plugin_filename:
+    value: nano_v3_reasoning_parser.py
+vllm_served_model_name:
+    value: nemotron3nano
+vllm_tensor_parallel_size:
+    value: 1
+vllm_tool_call_parser:
+    value: qwen3_coder
+vllm_use_reasoning_parser:
+    value: true
+wandb_entity:
+    value: ""
+wandb_project:
+    value: treerl-grpo
+wandb_run_name:
+    value: ""
+warmup_steps:
+    value: 10
+weight_decay:
+    value: 0.01

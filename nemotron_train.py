@@ -60,6 +60,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 import torch.nn.functional as F
@@ -91,8 +92,8 @@ class TreeRLConfig:
     # is incompatible with Nemotron's Mamba2 layers.
     train_model: str = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 
-    # Optional starting adapter to warm-start from (LoRA dir)
-    sft_adapter: str = ""
+    # Optional starting adapter to warm-start from (LoRA dir or HuggingFace repo)
+    sft_adapter: str = "orlandowhite/nemotron3_nano_sft"
 
     # Choose inference dtype
     # - "bf16" is simplest for merge->serve
@@ -175,6 +176,16 @@ class TreeRLConfig:
     beam_size: int = 4
     max_questions: int = 3
 
+    # Parallelization settings
+    # Number of rulings to process concurrently during rollouts
+    # vLLM handles batching internally - more concurrent rulings = better GPU utilization
+    parallel_rollouts: int = 4
+
+    # Benchmark evaluation settings
+    # Run a larger evaluation every N batches to get cleaner signal
+    benchmark_every_n_batches: int = 0  # 0 to disable
+    benchmark_num_rulings: int = 50  # Number of rulings to evaluate (held-out from training)
+
     # Data settings
     chapter: str = "84"
     rulings_per_batch: int = 5
@@ -182,6 +193,7 @@ class TreeRLConfig:
     num_batches: int = 20
     num_epochs: int = 3
     train_all: bool = False
+    start_batch: int = 0  # Skip to this batch number (for resuming mid-training)
 
     # Paths
     cross_rulings_file: str = "cross_rulings_dataset.json"
@@ -1152,6 +1164,14 @@ def run_online_rollout(
     os.environ["TREERL_CHAPTER_BEAM_SIZE"] = str(config.beam_size)
     os.environ["DISABLE_CROSS_RULING_INJECTION"] = "true"
 
+    # CRITICAL: Disable SFT training collector to enable parallel beam processing
+    # The classification engine uses ThreadPoolExecutor when this is false
+    os.environ["COLLECT_TRAINING_DATA"] = "false"
+
+    # Set parallel workers for within-classification beam parallelization
+    os.environ["PATH_WORKERS"] = str(config.beam_size * 2)
+    os.environ["CALIBRATE_WORKERS"] = str(config.beam_size * 2)
+
     product_description = ruling.get("short_product_description", "")
     gold_code = ruling.get("hts_code", "")
 
@@ -1179,6 +1199,14 @@ def run_online_rollout(
 
         logger.debug(f"  [rollout] Building gold trace for {gold_code}...")
         gold_trace = build_gold_trace(gold_code, hts_tree.navigator)
+        logger.info(f"  [rollout] Gold trace has {len(gold_trace)} steps for {gold_code}")
+
+        # SKIP rulings where gold code is not properly found in the HTS tree
+        # A trace of <=2 steps means only chapter (+ maybe heading prefix) was found
+        if len(gold_trace) <= 2:
+            logger.warning(f"  [rollout] ⚠️ SKIPPING - Gold code '{gold_code}' not found in HTS tree!")
+            logger.warning(f"  [rollout]    Gold trace: {gold_trace}")
+            return []
 
         logger.debug(f"  [rollout] Initializing auto-responder...")
         auto_responder = LLMAutoResponder(engine_name="groq", debug=False)
@@ -1838,6 +1866,68 @@ def compute_batch_accuracy(samples: List[Dict], logger: logging.Logger) -> Dict[
 
 
 # ============================================================================
+# BENCHMARK EVALUATION
+# ============================================================================
+
+def run_benchmark_evaluation(
+    benchmark_rulings: List[Dict],
+    config: TreeRLConfig,
+    logger: logging.Logger,
+    vllm_client: "VLLMInferenceClient",
+    global_batch_num: int,
+) -> Dict[str, float]:
+    """
+    Run evaluation on a held-out benchmark set for cleaner accuracy signal.
+    Uses parallel rollouts for efficiency.
+    """
+    logger.info(f"\n{'=' * 70}")
+    logger.info(f"📋 BENCHMARK EVALUATION (batch {global_batch_num})")
+    logger.info(f"{'=' * 70}")
+    logger.info(f"  Evaluating {len(benchmark_rulings)} held-out rulings...")
+
+    all_benchmark_samples = []
+
+    def run_single_rollout(ruling_idx_ruling):
+        """Worker function for parallel rollout execution."""
+        ruling_idx, ruling = ruling_idx_ruling
+        product_desc = ruling.get("short_product_description", "")[:50]
+        try:
+            samples = run_online_rollout(ruling, config, logger, vllm_client)
+            return ruling_idx, product_desc, samples, None
+        except Exception as e:
+            return ruling_idx, product_desc, [], str(e)
+
+    # Process benchmark rulings in parallel
+    with ThreadPoolExecutor(max_workers=config.parallel_rollouts) as executor:
+        futures = {
+            executor.submit(run_single_rollout, (idx, ruling)): idx
+            for idx, ruling in enumerate(benchmark_rulings)
+        }
+
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            ruling_idx, product_desc, samples, error = future.result()
+
+            if error:
+                logger.debug(f"  Benchmark [{completed}/{len(benchmark_rulings)}]: {product_desc}... ❌ {error}")
+            elif samples:
+                all_benchmark_samples.extend(samples)
+            # Quiet logging for benchmark
+
+    # Compute benchmark accuracy
+    benchmark_metrics = compute_batch_accuracy(all_benchmark_samples, logger)
+
+    logger.info(f"\n📊 BENCHMARK RESULTS:")
+    logger.info(f"  Exact match rate: {benchmark_metrics['exact_match_rate']:.1%} ({benchmark_metrics['num_exact_matches']}/{benchmark_metrics['num_rulings']})")
+    logger.info(f"  Avg best reward: {benchmark_metrics['avg_best_reward']:.4f}")
+    logger.info(f"  Avg reward: {benchmark_metrics['avg_reward']:.4f}")
+    logger.info(f"{'=' * 70}\n")
+
+    return benchmark_metrics
+
+
+# ============================================================================
 # WANDB
 # ============================================================================
 
@@ -1889,6 +1979,8 @@ def train(config: TreeRLConfig):
     logger.info(f"vLLM max len: {config.vllm_max_model_len}")
     logger.info(f"vLLM served name: {config.vllm_served_model_name}")
     logger.info(f"vLLM reasoning parser: {config.vllm_use_reasoning_parser}")
+    logger.info(f"Parallel rollouts: {config.parallel_rollouts}")
+    logger.info(f"Benchmark every N batches: {config.benchmark_every_n_batches} (0=disabled)")
 
     os.makedirs(config.output_dir, exist_ok=True)
     os.makedirs(config.adapter_sync_dir, exist_ok=True)
@@ -1907,13 +1999,115 @@ def train(config: TreeRLConfig):
     else:
         num_batches_per_epoch = config.num_batches
 
-    current_adapter_path = config.sft_adapter if config.sft_adapter else None
+    # Initialize adapter path - handle HuggingFace adapter download
+    current_adapter_path = None
+    if config.sft_adapter:
+        if os.path.isdir(config.sft_adapter):
+            # Local path
+            current_adapter_path = config.sft_adapter
+            logger.info(f"📦 Using local SFT adapter: {current_adapter_path}")
+        elif "/" in config.sft_adapter and not config.sft_adapter.startswith("/"):
+            # HuggingFace repo ID (e.g., "orlandowhite/nemotron_sft")
+            logger.info(f"📦 Downloading SFT adapter from HuggingFace: {config.sft_adapter}")
+            try:
+                from huggingface_hub import snapshot_download
+
+                # Download to a local cache dir
+                hf_cache_dir = os.path.join(config.adapter_sync_dir, "hf_sft_adapter")
+                os.makedirs(hf_cache_dir, exist_ok=True)
+
+                current_adapter_path = snapshot_download(
+                    repo_id=config.sft_adapter,
+                    local_dir=hf_cache_dir,
+                    local_dir_use_symlinks=False,
+                )
+                logger.info(f"  ✓ Downloaded to: {current_adapter_path}")
+
+                # Verify it's a valid adapter
+                adapter_config = os.path.join(current_adapter_path, "adapter_config.json")
+                if os.path.exists(adapter_config):
+                    logger.info(f"  ✓ Valid LoRA adapter found")
+                else:
+                    logger.warning(f"  ⚠️ No adapter_config.json found, may not be a LoRA adapter")
+
+            except Exception as e:
+                logger.error(f"❌ Failed to download HuggingFace adapter: {e}")
+                logger.warning(f"  Continuing without SFT adapter...")
+                current_adapter_path = None
+        else:
+            logger.warning(f"⚠️ SFT adapter path not found: {config.sft_adapter}")
+            current_adapter_path = None
 
     vllm_manager = VLLMServerManager(config, logger)
 
+    # Prepare benchmark held-out set (if enabled)
+    benchmark_rulings = []
+    if config.benchmark_every_n_batches > 0 and config.benchmark_num_rulings > 0:
+        # Use a fixed random seed for reproducible benchmark set
+        benchmark_rng = random.Random(42)
+        benchmark_rulings = benchmark_rng.sample(
+            rulings,
+            min(config.benchmark_num_rulings, len(rulings))
+        )
+        logger.info(f"\n📋 Benchmark set: {len(benchmark_rulings)} held-out rulings")
+        logger.info(f"   Will evaluate every {config.benchmark_every_n_batches} batches")
+
     training_start = time.time()
     all_metrics = []
-    global_batch_num = 0
+    global_batch_num = config.start_batch  # Start from specified batch (for resuming)
+
+    if config.start_batch > 0:
+        logger.info(f"\n⏭️  RESUMING from batch {config.start_batch}")
+        logger.info(f"   Skipping first {config.start_batch} batches")
+
+    # =============================================
+    # INITIAL BASELINE BENCHMARK (before any training)
+    # =============================================
+    if benchmark_rulings and config.benchmark_every_n_batches > 0:
+        logger.info(f"\n{'=' * 70}")
+        logger.info("📊 BASELINE BENCHMARK (before RL training)")
+        logger.info(f"{'=' * 70}")
+
+        # For baseline, we need to start vLLM with the initial model/adapter
+        base_for_serve = config.base_model_fp8 if config.inference_dtype.lower() == "fp8" else config.base_model_bf16
+
+        if current_adapter_path:
+            # Merge adapter for baseline
+            merged_dir = os.path.join(config.merged_models_dir, "merged_baseline")
+            _safe_rmtree(merged_dir)
+            baseline_model = merge_lora_into_bf16_base(
+                base_model_id=config.base_model_bf16,
+                adapter_path=current_adapter_path,
+                merged_out_dir=merged_dir,
+                logger=logger,
+            )
+        else:
+            baseline_model = base_for_serve
+
+        if vllm_manager.start_server(model_to_serve=baseline_model):
+            baseline_client = VLLMInferenceClient(config, logger, vllm_manager)
+
+            baseline_metrics = run_benchmark_evaluation(
+                benchmark_rulings,
+                config,
+                logger,
+                baseline_client,
+                global_batch_num=0,
+            )
+
+            # Log baseline to wandb
+            log_to_wandb(wandb_run, {
+                "exact_match_rate": baseline_metrics['exact_match_rate'],
+                "num_exact_matches": baseline_metrics['num_exact_matches'],
+                "avg_best_reward": baseline_metrics['avg_best_reward'],
+                "avg_reward": baseline_metrics['avg_reward'],
+                "num_rulings": baseline_metrics['num_rulings'],
+            }, step=0, prefix="benchmark")
+
+            # Stop vLLM to free memory
+            vllm_manager.stop_server()
+        else:
+            logger.error("Failed to start vLLM for baseline benchmark!")
 
     accuracy_rolling_samples = []
 
@@ -1933,6 +2127,13 @@ def train(config: TreeRLConfig):
 
         for batch_num in range(num_batches_per_epoch):
             global_batch_num += 1
+
+            # Skip batches if resuming from a later position
+            if global_batch_num <= config.start_batch:
+                if global_batch_num == config.start_batch:
+                    logger.info(f"⏭️  Skipped to batch {config.start_batch}, starting training...")
+                continue
+
             batch_start = time.time()
 
             logger.info(f"\n{'─' * 50}")
@@ -2000,18 +2201,41 @@ def train(config: TreeRLConfig):
                 vllm_client = VLLMInferenceClient(config, logger, vllm_manager)
 
                 # =========================================================
-                # PHASE 3: RUN ROLLOUTS
+                # PHASE 3: RUN ROLLOUTS (PARALLEL)
                 # =========================================================
                 logger.info(f"\n--- Phase 3: Running rollouts for {len(batch_rulings)} rulings ---")
-                for ruling_idx, ruling in enumerate(batch_rulings):
+                logger.info(f"  Parallel workers: {config.parallel_rollouts}")
+
+                def run_single_rollout(ruling_idx_ruling):
+                    """Worker function for parallel rollout execution."""
+                    ruling_idx, ruling = ruling_idx_ruling
                     product_desc = ruling.get("short_product_description", "")[:50]
-                    logger.info(f"\n  Ruling {ruling_idx+1}/{len(batch_rulings)}: {product_desc}...")
-                    samples = run_online_rollout(ruling, config, logger, vllm_client)
-                    if samples:
-                        all_batch_samples.extend(samples)
-                        logger.info(f"    → Collected {len(samples)} samples (total: {len(all_batch_samples)})")
-                    else:
-                        logger.warning(f"    → No samples collected")
+                    try:
+                        samples = run_online_rollout(ruling, config, logger, vllm_client)
+                        return ruling_idx, product_desc, samples, None
+                    except Exception as e:
+                        return ruling_idx, product_desc, [], str(e)
+
+                # Process rulings in parallel using ThreadPoolExecutor
+                # vLLM handles request batching internally for optimal GPU utilization
+                with ThreadPoolExecutor(max_workers=config.parallel_rollouts) as executor:
+                    futures = {
+                        executor.submit(run_single_rollout, (idx, ruling)): idx
+                        for idx, ruling in enumerate(batch_rulings)
+                    }
+
+                    completed = 0
+                    for future in as_completed(futures):
+                        completed += 1
+                        ruling_idx, product_desc, samples, error = future.result()
+
+                        if error:
+                            logger.warning(f"  [{completed}/{len(batch_rulings)}] Ruling {ruling_idx+1}: {product_desc}... ❌ Error: {error}")
+                        elif samples:
+                            all_batch_samples.extend(samples)
+                            logger.info(f"  [{completed}/{len(batch_rulings)}] Ruling {ruling_idx+1}: {product_desc}... ✓ {len(samples)} samples (total: {len(all_batch_samples)})")
+                        else:
+                            logger.warning(f"  [{completed}/{len(batch_rulings)}] Ruling {ruling_idx+1}: {product_desc}... ⚠️ No samples")
 
                 # =========================================================
                 # PHASE 4: STOP vLLM
@@ -2133,6 +2357,55 @@ def train(config: TreeRLConfig):
                 "num_samples": int(train_metrics.get("num_samples", 0)),
             }, step=global_batch_num, prefix="batch")
 
+            # =========================================================
+            # BENCHMARK EVALUATION (every N batches)
+            # =========================================================
+            if (config.benchmark_every_n_batches > 0 and
+                benchmark_rulings and
+                global_batch_num % config.benchmark_every_n_batches == 0):
+
+                logger.info(f"\n--- Running Benchmark Evaluation (batch {global_batch_num}) ---")
+
+                # Merge current adapter for benchmark
+                benchmark_merged_dir = os.path.join(config.merged_models_dir, f"merged_benchmark_b{global_batch_num}")
+                _safe_rmtree(benchmark_merged_dir)
+
+                if current_adapter_path:
+                    benchmark_model = merge_lora_into_bf16_base(
+                        base_model_id=config.base_model_bf16,
+                        adapter_path=current_adapter_path,
+                        merged_out_dir=benchmark_merged_dir,
+                        logger=logger,
+                    )
+                else:
+                    benchmark_model = config.base_model_fp8 if config.inference_dtype.lower() == "fp8" else config.base_model_bf16
+
+                # Start vLLM for benchmark
+                if vllm_manager.start_server(model_to_serve=benchmark_model):
+                    benchmark_client = VLLMInferenceClient(config, logger, vllm_manager)
+
+                    benchmark_metrics = run_benchmark_evaluation(
+                        benchmark_rulings,
+                        config,
+                        logger,
+                        benchmark_client,
+                        global_batch_num,
+                    )
+
+                    # Log benchmark to wandb
+                    log_to_wandb(wandb_run, {
+                        "exact_match_rate": benchmark_metrics['exact_match_rate'],
+                        "num_exact_matches": benchmark_metrics['num_exact_matches'],
+                        "avg_best_reward": benchmark_metrics['avg_best_reward'],
+                        "avg_reward": benchmark_metrics['avg_reward'],
+                        "num_rulings": benchmark_metrics['num_rulings'],
+                    }, step=global_batch_num, prefix="benchmark")
+
+                    # Stop vLLM to free memory for next training batch
+                    vllm_manager.stop_server()
+                else:
+                    logger.error("Failed to start vLLM for benchmark!")
+
             batch_time = time.time() - batch_start
             logger.info(f"\n{'─' * 50}")
             logger.info(f"Batch {batch_num + 1} Summary:")
@@ -2213,7 +2486,8 @@ def main():
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp8"],
                         help="vLLM inference dtype (serving). Merges are done into BF16.")
 
-    parser.add_argument("--sft-adapter", type=str, default="", help="Starting LoRA adapter path (optional)")
+    parser.add_argument("--sft-adapter", type=str, default="orlandowhite/nemotron3_nano_sft", 
+                        help="Starting LoRA adapter (HuggingFace repo or local path)")
 
     # Context lengths
     parser.add_argument("--vllm-max-len", type=int, default=262144, help="vLLM max model len")
@@ -2246,6 +2520,14 @@ def main():
     parser.add_argument("--accuracy-window", type=int, default=10, help="Accuracy rolling window (unique rulings)")
     parser.add_argument("--num-batches", type=int, default=20, help="Batches per epoch")
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
+    parser.add_argument("--start-batch", type=int, default=0, help="Skip to this batch number (for resuming)")
+
+    # Parallelization
+    parser.add_argument("--parallel-rollouts", type=int, default=4, help="Number of concurrent rollouts")
+
+    # Benchmark evaluation
+    parser.add_argument("--benchmark-every-n-batches", type=int, default=0, help="Run benchmark every N batches (0 to disable)")
+    parser.add_argument("--benchmark-num-rulings", type=int, default=50, help="Number of held-out rulings for benchmark")
 
     # Advantage normalization
     parser.add_argument("--advantage-method", type=str, default="gdpo",
@@ -2299,6 +2581,10 @@ def main():
         accuracy_window_size=args.accuracy_window,
         num_batches=args.num_batches,
         num_epochs=args.epochs,
+        start_batch=args.start_batch,
+        parallel_rollouts=args.parallel_rollouts,
+        benchmark_every_n_batches=args.benchmark_every_n_batches,
+        benchmark_num_rulings=args.benchmark_num_rulings,
         advantage_method=args.advantage_method,
         gdpo_reward_weights=tuple(float(x.strip()) for x in args.gdpo_reward_weights.split(",") if x.strip()),
         chapter=args.chapter,

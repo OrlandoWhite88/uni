@@ -437,8 +437,7 @@ fall in multiple chapters (composite products, dual-use items).
 OUTPUT FORMAT (JSON):
 
 {
-  "detailed_internal_reasoning": "Your complete expert reasoning process",
-  "thinking": "Detailed reasoning—GRI application, CROSS ruling comparison, 
+  "thinking": "Brief reasoning—GRI application, CROSS ruling comparison, 
                professional knowledge, why this chapter over alternatives",
   "top_selection": "XX",
   "chapters": [
@@ -515,8 +514,7 @@ If primary_selection's information_context_score < 0.60, set should_proceed to f
 OUTPUT FORMAT (JSON):
 
 {
-  "detailed_internal_reasoning": "Your complete expert reasoning process",
-  "thinking": "Analysis of key options, GRI application, why primary chosen, 
+  "thinking": "Brief analysis of key options, GRI application, why primary chosen, 
                what makes alternatives viable, fallback justification",
   "primary_selection": {
     "option_index": N,
@@ -546,6 +544,7 @@ OUTPUT FORMAT (JSON):
 }
 
 REQUIRED FIELDS:
+- option_index: The 1-based index matching the candidate's "index" field (1, 2, 3... NOT 0-based)
 - should_proceed: true if primary_selection's information_context_score >= 0.60
 - All three selections must have different option_index values
 - primary_selection must have the highest path_score among the three
@@ -581,8 +580,7 @@ Common Question Types:
 OUTPUT FORMAT (JSON):
 
 {
-  "detailed_internal_reasoning": "Your complete expert reasoning process",
-  "thinking": "What information is missing, why it matters at this level, 
+  "thinking": "Brief explanation of what information is missing, why it matters at this level, 
                what question most efficiently resolves uncertainty",
   "question_type": "multiple_choice",
   "question_text": "Clear, natural question with product context",
@@ -615,8 +613,7 @@ CONSTRAINTS:
 OUTPUT FORMAT (JSON):
 
 {
-  "detailed_internal_reasoning": "Your complete expert reasoning process",
-  "thinking": "What the answer reveals, how it maps to classification criteria, 
+  "thinking": "Brief summary of what the answer reveals, how it maps to classification criteria, 
                what remains unknown",
   "updated_description": "Enhanced product description with new information",
   "extracted_attributes": {

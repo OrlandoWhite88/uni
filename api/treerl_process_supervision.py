@@ -297,6 +297,12 @@ def emit_leaf_samples(
             # Leaf-level reward (fractional prefix match)
             "leaf_reward": leaf_reward,
             
+            # GDPO advantage for optional loss scaling (computed externally)
+            "gdpo_advantage": leaf.get("gdpo_advantage", 0.0),
+            
+            # Reward components for debugging/analysis
+            "reward_components": leaf.get("reward_components", {}),
+            
             # Step-level rewards - training loop applies these per-step during backprop
             "step_rewards": step_rewards_list,
             

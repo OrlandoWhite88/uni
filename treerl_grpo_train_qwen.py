@@ -123,7 +123,8 @@ class TreeRLConfig:
     base_model: str = "Qwen/Qwen3-14B"  # Model for training (Unsloth will quantize)
     train_model: str = "Qwen/Qwen3-14B"  # Alias for base_model (for compatibility)
     vllm_model: str = ""  # Model for vLLM inference (empty = use base_model)
-    sft_adapter: str = ""  # Optional: Starting LoRA adapter path
+    sft_adapter: str = "treerl_checkpoints/adapter_sync/adapter_1768520829"  # Starting LoRA adapter (HuggingFace or local path)
+
     
     # Context length settings
     # Qwen3-14B native: 32768, extendable to 128k+ with YaRN
@@ -139,25 +140,27 @@ class TreeRLConfig:
     
     # Qwen3 reasoning/thinking mode settings
     enable_thinking: bool = True  # Enable thinking mode for better accuracy
+    json_thinking: bool = False  # Enable thinking for JSON responses (adds tokens but may improve quality)
     
     # Generation settings (Qwen3 recommended)
     # Thinking mode: temp=0.6, top_p=0.95, top_k=20
     # Non-thinking: temp=0.7, top_p=0.8, top_k=20
-    rollout_temperature: float = 0.6  # 0.6 for thinking, 0.7 for non-thinking
+    rollout_temperature: float = 0.4  # 0.6 for thinking, 0.7 for non-thinking
     rollout_top_p: float = 0.95  # 0.95 for thinking, 0.8 for non-thinking
     rollout_top_k: int = 20
     rollout_min_p: float = 0.0  # Qwen3 default
     
     # IMPORTANT: max_new_tokens will be calculated dynamically based on input length
     # This is a fallback/cap value, not the actual value used
-    rollout_max_new_tokens_cap: int = 16384  # Cap for output tokens
+    rollout_max_new_tokens_cap: int = 6000  # Cap for output tokens (reasoning)
+    json_max_tokens: int = 5000  # Cap for JSON responses (chapter/score selection) - needs room for thinking
     
     # vLLM settings
     vllm_host: str = "127.0.0.1"
     vllm_port: int = 8000
     # Lower GPU utilization to leave headroom for memory fragmentation
-    # 0.85 = 118.8GB on 140GB GPU, leaving ~21GB buffer
-    vllm_gpu_memory_utilization: float = 0.85
+    # 0.80 = 112GB on 140GB GPU, leaving ~28GB buffer
+    vllm_gpu_memory_utilization: float = 0.80
     vllm_max_model_len: int = 131072  # Extended with YaRN (32768 * 4)
     
     # vLLM LoRA support - Qwen3 fully supports this
@@ -171,8 +174,8 @@ class TreeRLConfig:
     vllm_reasoning_parser: str = ""  # Options: "", "deepseek_r1", "qwen3" (if supported)
     
     # LoRA settings for training
-    lora_rank: int = 32  # Larger rank for better learning
-    lora_alpha: int = 64  # 2x rank speeds up training
+    lora_rank: int = 64  # Must match SFT adapter (orlandowhite/qwen3_sft uses rank 64)
+    lora_alpha: int = 128  # 2x rank
     lora_target_modules: Tuple[str, ...] = (
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -181,44 +184,44 @@ class TreeRLConfig:
     # Training settings
     learning_rate: float = 5e-5
     weight_decay: float = 0.01
-    warmup_steps: int = 10
+    warmup_steps: int = 0
     gradient_accumulation_steps: int = 4
     max_grad_norm: float = 1.0
 
     # Advantage shaping / normalization
-    advantage_method: str = "gdpo"  # none | grpo | grpo_no_std | gdpo
+    advantage_method: str = "gdpo"  # none | grpo | gdpo
     gdpo_reward_weights: Tuple[float, ...] = (1.0, 1.0)
-    # Apply GDPO-style decoupled normalization to leaf rewards before TreeRL
-    use_gdpo_treerl_rewards: bool = True
     gdpo_eps: float = 1e-6
-    gdpo_fallback_to_raw: bool = True
-    # Whether to scale the loss by per-leaf advantages (off by default)
-    apply_leaf_advantage_scaling: bool = False
+    # Whether to scale the loss by GDPO per-leaf advantages
+    # Per GDPO paper: use normalized advantages for loss scaling, NOT for TreeRL values
+    apply_leaf_advantage_scaling: bool = True  # Enable by default for GDPO
     
     # TreeRL settings
     beam_size: int = 4
-    max_questions: int = 3
+    max_questions: int = 5
     
     # Parallelization settings
     # Number of rulings to process concurrently during rollouts
     # vLLM handles batching internally - more concurrent rulings = better GPU utilization
     # Set based on GPU memory: 2-4 for 24GB, 4-8 for 48GB, 8-16 for 80GB+
-    parallel_rollouts: int = 4
+    parallel_rollouts: int = 8
     
     # Benchmark evaluation settings
     # Run a larger evaluation every N batches to get cleaner signal
-    benchmark_every_n_batches: int = 50  # 0 to disable
-    benchmark_num_rulings: int = 30  # Number of rulings to evaluate (held-out from training)
+    benchmark_every_n_batches: int = 0  # 0 to disable (disabled by default)
+    benchmark_num_rulings: int = 50  # Number of rulings to evaluate (held-out from training)
     
     # Data settings
     chapter: str = "84"
     # Batch = process N rulings, run rollouts, train on all samples
     # Epoch = run multiple batches (or all rulings if train_all=True)
     rulings_per_batch: int = 5  # Number of rulings per batch
-    accuracy_window_size: int = 10  # Track accuracy over the last N rulings (sliding window)
+    accuracy_window_size: int = 20  # Primary rolling window size (rulings)
+    accuracy_window_sizes: Tuple[int, ...] = (10, 20, 50)  # Multiple windows for diagnostics
     num_batches: int = 20  # Number of batches per epoch (ignored if train_all=True)
     num_epochs: int = 3  # Number of full epochs
     train_all: bool = False  # If True, train on ALL rulings in chapter (not random sampling)
+    start_batch: int = 0  # Skip to this batch number (for resuming mid-training)
     
     # Paths
     cross_rulings_file: str = "cross_rulings_dataset.json"
@@ -241,6 +244,8 @@ class TreeRLConfig:
     wandb_project: str = "treerl-grpo"
     wandb_run_name: str = ""  # Auto-generated if empty
     wandb_entity: str = ""  # Your wandb username/team
+    wandb_resume: bool = False  # Resume a previous run
+    wandb_run_id: str = ""  # Run ID to resume (required if wandb_resume=True)
     
     # Device
     device: str = "cuda"
@@ -248,6 +253,13 @@ class TreeRLConfig:
     # Leaf reward shaping
     leaf_reward_weights: Tuple[float, ...] = (0.85, 0.15)
     leaf_reward_clip_0_1: bool = True
+    
+    # Length penalty to prevent hitting max tokens
+    # Penalty ramps up as output approaches max_tokens
+    length_penalty_enabled: bool = False
+    length_penalty_max_tokens: int = 6000  # Target max (should match rollout_max_new_tokens_cap)
+    length_penalty_start_ratio: float = 0.5  # Start penalizing at 3000 tokens (3000/6000)
+    length_penalty_max: float = 0.9  # Maximum penalty at max_tokens (0.9 = reward * 0.1)
     
     # IMPORTANT: Disable fast_inference - we use external vLLM
     # Setting this False prevents Unsloth from loading its own vLLM
@@ -646,6 +658,18 @@ class VLLMInferenceClient:
         self.server_manager = server_manager
         self.base_url = f"http://{config.vllm_host}:{config.vllm_port}"
         
+        # Initialize OpenAI client pointing to vLLM server
+        try:
+            from openai import OpenAI
+            self.openai_client = OpenAI(
+                base_url=f"{self.base_url}/v1",
+                api_key="not-needed",  # vLLM doesn't require API key
+            )
+            logger.info(f"  ✓ OpenAI client initialized for vLLM at {self.base_url}")
+        except ImportError:
+            logger.warning("  ⚠️ openai package not installed, falling back to requests")
+            self.openai_client = None
+        
         # Try to load system prompt
         try:
             from api.system_prompts_updated import UNIFIED_SYSTEM_PROMPT
@@ -706,11 +730,17 @@ class VLLMInferenceClient:
         total += 50
         return total
     
-    def _calculate_max_tokens(self, messages: List[Dict[str, str]], requested_max: Optional[int] = None) -> int:
+    def _calculate_max_tokens(
+        self, 
+        messages: List[Dict[str, str]], 
+        requested_max: Optional[int] = None,
+        is_json: bool = False,
+    ) -> int:
         """
         Calculate safe max_tokens based on input length and model context.
         
         CRITICAL FIX: Prevents "max_tokens too large" errors.
+        For JSON responses, uses a much lower cap to avoid runaway thinking.
         """
         # Estimate input tokens
         input_tokens = self._estimate_messages_tokens(messages)
@@ -718,11 +748,19 @@ class VLLMInferenceClient:
         # Calculate available space
         available = self.config.vllm_max_model_len - input_tokens - self.config.token_safety_margin
         
+        # Use lower cap for JSON responses (chapter selection, scores)
+        # These should be short responses, not 16K token essays
+        cap = self.config.json_max_tokens if is_json else self.config.rollout_max_new_tokens_cap
+        
         # Apply cap
         if requested_max is not None:
-            safe_max = min(requested_max, available, self.config.rollout_max_new_tokens_cap)
+            safe_max = min(requested_max, available, cap)
         else:
-            safe_max = min(available, self.config.rollout_max_new_tokens_cap)
+            safe_max = min(available, cap)
+        
+        # Debug: log when cap is limiting factor
+        if safe_max == cap and available > cap:
+            self.logger.debug(f"    [max_tokens] Using cap={cap} (json={is_json}), available={available}")
         
         # Ensure minimum viable output
         safe_max = max(safe_max, 256)  # At least 256 tokens
@@ -803,8 +841,8 @@ class VLLMInferenceClient:
         if not response_text:
             raise ValueError("No response text to parse.")
 
-        # First, extract content after </think> if present
-        _, content = self._extract_thinking_and_content(response_text)
+        # Extract content after </think> if present (for thinking mode)
+        thinking, content = self._extract_thinking_and_content(response_text)
         text = content.strip() if content else response_text.strip()
 
         # Remove markdown code blocks
@@ -895,6 +933,68 @@ class VLLMInferenceClient:
 
         raise ValueError(f"Failed to extract valid JSON from response: {response_text[:500]}...")
 
+    def _prepare_messages_for_call(
+        self,
+        messages: List[Dict[str, str]],
+        requires_json: bool,
+    ) -> List[Dict[str, str]]:
+        """
+        Ensure message history fits within context window.
+        
+        We cannot exceed vLLM's max context length. If it does:
+        - For JSON calls: keep only system + last user (minimal prompt)
+        - For non-JSON: keep system + last 2 user/assistant turns
+        - If still too long, hard-truncate the last user content
+        """
+        if not messages:
+            return messages
+
+        max_len = self.config.vllm_max_model_len
+        if max_len <= 0:
+            return messages
+
+        input_tokens = self._estimate_messages_tokens(messages)
+        if input_tokens + self.config.token_safety_margin <= max_len:
+            return messages
+
+        system_msg = messages[0] if messages[0].get("role") == "system" else None
+
+        # Find last user message
+        last_user_idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+
+        if last_user_idx is None:
+            trimmed = [m for m in [system_msg, messages[-1]] if m]
+        else:
+            last_user_msg = messages[last_user_idx]
+            if requires_json:
+                trimmed = [m for m in [system_msg, last_user_msg] if m]
+            else:
+                tail = messages[max(0, last_user_idx - 2):]
+                trimmed = [m for m in [system_msg] if m] + tail
+
+        # If still too long, hard-truncate the last user message content
+        if self._estimate_messages_tokens(trimmed) + self.config.token_safety_margin > max_len:
+            for i in range(len(trimmed) - 1, -1, -1):
+                if trimmed[i].get("role") == "user":
+                    content = trimmed[i].get("content", "")
+                    if isinstance(content, str) and len(content) > 200:
+                        while len(content) > 200 and (
+                            self._estimate_messages_tokens(trimmed) + self.config.token_safety_margin > max_len
+                        ):
+                            content = content[: int(len(content) * 0.8)]
+                            trimmed[i]["content"] = content
+                    break
+
+        self.logger.warning(
+            f"  ⚠️ Context too long; trimming messages. "
+            f"tokens≈{input_tokens}, max_len={max_len}, json={requires_json}"
+        )
+        return trimmed
+
     def _call_vllm_api(
         self,
         messages: List[Dict[str, str]],
@@ -905,11 +1005,10 @@ class VLLMInferenceClient:
         """
         Call vLLM OpenAI-compatible API with Qwen3 support.
         
-        CRITICAL FIX: Calculates max_tokens dynamically based on input length.
+        CRITICAL: For JSON requests, disable thinking mode to get clean JSON output.
+        Uses OpenAI client for cleaner handling.
         """
         gen_start = time.time()
-        
-        url = f"{self.base_url}/v1/chat/completions"
         
         # Use LoRA adapter model name if available, else base model
         if self.server_manager.current_lora:
@@ -917,46 +1016,88 @@ class VLLMInferenceClient:
         else:
             model_name = self.server_manager.current_model or self.config.base_model
         
-        # CRITICAL FIX: Calculate safe max_tokens
-        safe_max_tokens = self._calculate_max_tokens(messages, max_tokens)
+        # Ensure input fits context window
+        messages = self._prepare_messages_for_call(messages, requires_json)
+        
+        # Calculate safe max_tokens
+        safe_max_tokens = self._calculate_max_tokens(messages, max_tokens, is_json=requires_json)
         
         # Qwen3 sampling parameters
         if requires_json:
+            # JSON mode: lower temp, optionally enable thinking
             effective_temp = 0.7
             effective_top_p = 0.8
+            enable_thinking = self.config.json_thinking  # Configurable: thinking for JSON
         else:
+            # Reasoning mode: higher temp, enable thinking
             effective_temp = temperature if temperature > 0 else self.config.rollout_temperature
             effective_top_p = self.config.rollout_top_p
-        
-        payload = {
-            "model": model_name,
-            "messages": messages,
-            "max_tokens": safe_max_tokens,
-            "temperature": effective_temp,
-            "top_p": effective_top_p,
-            "top_k": self.config.rollout_top_k,
-        }
-        
-        if hasattr(self.config, 'rollout_min_p'):
-            payload["min_p"] = self.config.rollout_min_p
+            enable_thinking = self.config.enable_thinking
         
         try:
-            resp = requests.post(url, json=payload, timeout=300)
-            resp.raise_for_status()
-            result = resp.json()
+            if self.openai_client:
+                # Use OpenAI client (cleaner, handles edge cases better)
+                extra_body = {
+                    "top_k": self.config.rollout_top_k,
+                    # CRITICAL: Control thinking mode via chat_template_kwargs
+                    "chat_template_kwargs": {"enable_thinking": enable_thinking},
+                }
+                if hasattr(self.config, 'rollout_min_p') and self.config.rollout_min_p > 0:
+                    extra_body["min_p"] = self.config.rollout_min_p
+                
+                response = self.openai_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    max_tokens=safe_max_tokens,
+                    temperature=effective_temp,
+                    top_p=effective_top_p,
+                    extra_body=extra_body,
+                )
+                
+                choice = response.choices[0]
+                output_text = choice.message.content or ""
+                reasoning_text = getattr(choice.message, 'reasoning_content', None) or ""
+                finish_reason = choice.finish_reason or "unknown"
+                
+                prompt_tokens = response.usage.prompt_tokens if response.usage else 0
+                completion_tokens = response.usage.completion_tokens if response.usage else 0
+                
+            else:
+                # Fallback to requests (legacy)
+                url = f"{self.base_url}/v1/chat/completions"
+                payload = {
+                    "model": model_name,
+                    "messages": messages,
+                    "max_tokens": safe_max_tokens,
+                    "temperature": effective_temp,
+                    "top_p": effective_top_p,
+                    "top_k": self.config.rollout_top_k,
+                    # CRITICAL: Control thinking mode
+                    "chat_template_kwargs": {"enable_thinking": enable_thinking},
+                }
+                if hasattr(self.config, 'rollout_min_p') and self.config.rollout_min_p > 0:
+                    payload["min_p"] = self.config.rollout_min_p
+                
+                resp = requests.post(url, json=payload, timeout=300)
+                resp.raise_for_status()
+                result = resp.json()
+                
+                choice = result.get("choices", [{}])[0]
+                message = choice.get("message", {})
+                output_text = message.get("content") or ""
+                reasoning_text = message.get("reasoning_content") or ""
+                finish_reason = choice.get("finish_reason", "unknown")
+                
+                usage = result.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
             
             # Log completion
-            self._log_completion(payload, result)
+            self._log_completion(
+                {"model": model_name, "max_tokens": safe_max_tokens, "messages_count": len(messages)},
+                {"finish_reason": finish_reason, "completion_tokens": completion_tokens}
+            )
             
-            # Extract response
-            choice = result.get("choices", [{}])[0]
-            message = choice.get("message", {})
-            finish_reason = choice.get("finish_reason", "unknown")
-            
-            # Log stats
-            usage = result.get("usage", {})
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
             gen_elapsed = time.time() - gen_start
             tok_per_sec = completion_tokens / gen_elapsed if gen_elapsed > 0 else 0
             
@@ -966,23 +1107,19 @@ class VLLMInferenceClient:
             )
             
             if finish_reason == "length":
-                self.logger.warning(f"  ⚠️ Hit max_tokens ({safe_max_tokens})!")
+                self.logger.warning(f"  ⚠️ Hit max_tokens ({safe_max_tokens})! json_request={requires_json}")
+                if requires_json:
+                    self.logger.warning(f"  ⚠️ JSON request truncated!")
             
-            # Handle Qwen3 reasoning response format
-            output_text = message.get("content") or ""
-            reasoning_text = message.get("reasoning_content") or ""
-            
+            # Handle Qwen3 reasoning response format (when using --reasoning-parser)
             if not output_text and reasoning_text:
                 output_text = f"{self._think_start}{reasoning_text}{self._think_end}"
                 self.logger.debug("  Reconstructed response from reasoning_content")
             
+            # Debug logging (only when thinking is enabled and present)
             if output_text and self._think_start in output_text:
-                thinking, _ = self._extract_thinking_and_content(output_text)
-                if thinking:
-                    self.logger.debug(f"  Thinking tokens: ~{len(thinking.split())}")
-            
-            if not output_text:
-                output_text = choice.get("text") or ""
+                thinking, final = self._extract_thinking_and_content(output_text)
+                self.logger.debug(f"    [vLLM] Thinking: {len(thinking)} chars, Final: {len(final)} chars")
             
             if output_text:
                 self.logger.debug(f"    [vLLM Response] len={len(output_text)}")
@@ -991,7 +1128,7 @@ class VLLMInferenceClient:
             
             return output_text.strip()
             
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             self.logger.error(f"vLLM API error: {e}")
             raise
 
@@ -1111,7 +1248,7 @@ class VLLMInferenceClient:
 # ============================================================================
 
 def load_chapter_rulings(config: TreeRLConfig, logger: logging.Logger) -> List[Dict]:
-    """Load cross rulings filtered by chapter."""
+    """Load cross rulings filtered by chapter, excluding rulings with codes not in the HTS tree."""
     logger.info(f"Loading rulings from {config.cross_rulings_file}")
     
     if not os.path.exists(config.cross_rulings_file):
@@ -1127,7 +1264,50 @@ def load_chapter_rulings(config: TreeRLConfig, logger: logging.Logger) -> List[D
     ]
     
     logger.info(f"Total rulings: {len(all_rulings)}")
-    logger.info(f"Chapter {config.chapter} rulings: {len(chapter_rulings)}")
+    logger.info(f"Chapter {config.chapter} rulings (before validation): {len(chapter_rulings)}")
+    
+    # Validate rulings against HTS tree - skip codes that don't exist
+    try:
+        from api.groq_tree_engine import HTSTree
+        from api.treerl_gold_trace import build_gold_trace
+        
+        hts_tree = HTSTree()
+        hts_data_file = Path(config.cross_rulings_file).parent / "api" / "hts_data.json"
+        if not hts_data_file.exists():
+            hts_data_file = Path(__file__).parent / "api" / "hts_data.json"
+        
+        if hts_data_file.exists():
+            with open(hts_data_file, "r", encoding="utf-8") as f:
+                hts_data = json.load(f)
+            hts_tree.build_from_json(hts_data)
+            
+            valid_rulings = []
+            skipped_codes = []
+            
+            for ruling in chapter_rulings:
+                gold_code = ruling.get("hts_code", "")
+                gold_trace = build_gold_trace(gold_code, hts_tree.navigator)
+                
+                # Only keep rulings where the gold code was properly found (>2 steps)
+                if len(gold_trace) > 2:
+                    valid_rulings.append(ruling)
+                else:
+                    skipped_codes.append(gold_code)
+            
+            if skipped_codes:
+                logger.warning(f"⚠️ Skipped {len(skipped_codes)} rulings with codes not in HTS tree:")
+                for code in skipped_codes[:10]:
+                    logger.warning(f"    - {code}")
+                if len(skipped_codes) > 10:
+                    logger.warning(f"    ... and {len(skipped_codes) - 10} more")
+            
+            logger.info(f"Chapter {config.chapter} rulings (after validation): {len(valid_rulings)}")
+            return valid_rulings
+        else:
+            logger.warning(f"HTS data file not found, skipping validation: {hts_data_file}")
+            
+    except Exception as e:
+        logger.warning(f"Could not validate rulings against HTS tree: {e}")
     
     return chapter_rulings
 
@@ -1400,15 +1580,65 @@ def run_online_rollout(
             r = max(0.0, min(1.0, r))
         return r
 
-    def _apply_gdpo_leaf_rewards(
+    def _compute_length_penalty(trajectory: List[Dict[str, Any]]) -> float:
+        """
+        Compute length penalty based on trajectory token count.
+        
+        Returns a multiplier in [1 - max_penalty, 1.0]:
+        - 1.0 = no penalty (short output)
+        - 1 - max_penalty = maximum penalty (at or above max_tokens)
+        
+        Penalty ramps linearly from start_ratio to 1.0 of max_tokens.
+        """
+        if not config.length_penalty_enabled or not trajectory:
+            return 1.0
+        
+        # Estimate token count from trajectory content
+        # Use ~4 chars per token as rough estimate, or count actual content
+        total_chars = 0
+        for msg in trajectory:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+        
+        # Rough token estimate (4 chars per token)
+        estimated_tokens = total_chars / 4.0
+        
+        max_tokens = config.length_penalty_max_tokens
+        start_tokens = max_tokens * config.length_penalty_start_ratio
+        
+        if estimated_tokens <= start_tokens:
+            return 1.0  # No penalty
+        
+        if estimated_tokens >= max_tokens:
+            # At or beyond max: apply maximum penalty
+            return 1.0 - config.length_penalty_max
+        
+        # Linear ramp between start and max
+        progress = (estimated_tokens - start_tokens) / (max_tokens - start_tokens)
+        penalty = progress * config.length_penalty_max
+        
+        return 1.0 - penalty
+
+    def _compute_gdpo_advantages(
         leaves: List[Dict[str, Any]],
         weights: Tuple[float, ...],
         eps: float,
-        fallback_to_raw: bool,
-    ) -> bool:
-        """Compute GDPO-style decoupled normalized rewards per leaf."""
+    ) -> None:
+        """
+        Compute GDPO-style decoupled normalized ADVANTAGES per leaf.
+        
+        Per GDPO paper: Normalize each reward component independently (decoupled),
+        then sum weighted normalized values to get advantages.
+        
+        CRITICAL: These are ADVANTAGES for loss scaling, NOT replacement rewards.
+        TreeRL should still use RAW rewards for V(s) computation.
+        
+        Stores "gdpo_advantage" on each leaf for optional loss scaling.
+        """
         if not leaves:
-            return False
+            return
+        
         components = ["trace_prefix", "code_digits_prefix"]
         values_by_comp = {}
         for comp in components:
@@ -1416,11 +1646,13 @@ def run_online_rollout(
                 float(leaf.get("reward_components", {}).get(comp, 0.0) or 0.0)
                 for leaf in leaves
             ]
+        
         w = list(weights or ())
         if len(w) < len(components):
             w += [1.0] * (len(components) - len(w))
         w = w[:len(components)]
 
+        # GDPO: Normalize each component independently (decoupled normalization)
         normalized_by_comp = {}
         for comp, vals in values_by_comp.items():
             if not vals:
@@ -1430,27 +1662,33 @@ def run_online_rollout(
             var = sum((v - mu) ** 2 for v in vals) / len(vals)
             sd = math.sqrt(max(var, 0.0))
             if sd < eps:
+                # No variance - all same value, advantage = 0
                 normalized_by_comp[comp] = [0.0 for _ in vals]
             else:
                 normalized_by_comp[comp] = [(v - mu) / (sd + eps) for v in vals]
 
-        gdpo_values = []
+        # Compute per-leaf GDPO advantage (weighted sum of normalized components)
+        gdpo_advantages = []
         for i in range(len(leaves)):
             total = 0.0
             for comp_idx, comp in enumerate(components):
                 comp_vals = normalized_by_comp.get(comp, [])
                 if i < len(comp_vals):
                     total += float(w[comp_idx]) * float(comp_vals[i])
-            gdpo_values.append(total)
+            gdpo_advantages.append(total)
+        
+        # Optional: Batch-wise normalization of advantages (per GDPO paper Eq. 6)
+        if len(gdpo_advantages) > 1:
+            adv_mu = sum(gdpo_advantages) / len(gdpo_advantages)
+            adv_var = sum((a - adv_mu) ** 2 for a in gdpo_advantages) / len(gdpo_advantages)
+            adv_sd = math.sqrt(max(adv_var, 0.0))
+            if adv_sd > eps:
+                gdpo_advantages = [(a - adv_mu) / (adv_sd + eps) for a in gdpo_advantages]
 
-        if fallback_to_raw and all(abs(v) < eps for v in gdpo_values):
-            for leaf in leaves:
-                leaf["treerl_reward"] = float(leaf.get("reward", 0.0) or 0.0)
-            return True
-
-        for leaf, val in zip(leaves, gdpo_values):
-            leaf["treerl_reward"] = float(val)
-        return True
+        # Store GDPO advantages on leaves (for optional loss scaling)
+        # Do NOT replace "reward" - TreeRL needs raw rewards for V(s)
+        for leaf, adv in zip(leaves, gdpo_advantages):
+            leaf["gdpo_advantage"] = float(adv)
     
     os.environ["TREERL_BEAM_SIZE"] = str(config.beam_size)
     os.environ["TREERL_CHAPTER_BEAM_SIZE"] = str(config.beam_size)
@@ -1492,6 +1730,14 @@ def run_online_rollout(
         
         logger.debug(f"  [rollout] Building gold trace for {gold_code}...")
         gold_trace = build_gold_trace(gold_code, hts_tree.navigator)
+        logger.info(f"  [rollout] Gold trace has {len(gold_trace)} steps for {gold_code}")
+        
+        # SKIP rulings where gold code is not properly found in the HTS tree
+        # A trace of <=2 steps means only chapter (+ maybe heading prefix) was found
+        if len(gold_trace) <= 2:
+            logger.warning(f"  [rollout] ⚠️ SKIPPING - Gold code '{gold_code}' not found in HTS tree!")
+            logger.warning(f"  [rollout]    Gold trace: {gold_trace}")
+            return []
         
         logger.debug(f"  [rollout] Initializing auto-responder...")
         auto_responder = LLMAutoResponder(engine_name="groq", debug=False)
@@ -1499,6 +1745,7 @@ def run_online_rollout(
             auto_responder.llm_client = vllm_client
         
         logger.info(f"  [rollout] Starting classification (max_q={config.max_questions}, beam={config.beam_size})...")
+        logger.info(f"  [rollout] Product: {product_description[:100]}...")
         if config.max_questions > 0:
             result = auto_responder.interactive_classify_with_auto_response(
                 hts_tree=hts_tree,
@@ -1516,35 +1763,66 @@ def run_online_rollout(
             )
         logger.info(f"  [rollout] Classification complete")
         
+        # DIAGNOSTIC: Check if classification actually completed properly
+        if result.get("final"):
+            final_code = result.get("final_code") or result.get("classification", {}).get("final_code", "N/A")
+            logger.info(f"  [rollout] Final result: {final_code}")
+        else:
+            logger.warning(f"  [rollout] ⚠️ Classification not final! Has pending question?")
+        
         state = result.get("state", {})
         leaves = []
         beam = state.get("beam", [])
         
-        for path_data in beam:
+        # DIAGNOSTIC: Log beam state
+        logger.info(f"  [rollout] Beam has {len(beam)} paths")
+        if not beam:
+            logger.warning(f"  [rollout] ⚠️ EMPTY BEAM! Classification may have failed.")
+            logger.warning(f"  [rollout]    Result keys: {list(result.keys())}")
+            logger.warning(f"  [rollout]    State keys: {list(state.keys()) if state else 'None'}")
+        
+        for path_idx, path_data in enumerate(beam):
             if isinstance(path_data, dict):
                 classification_path = path_data.get("classification_path", [])
                 trajectory = path_data.get("trajectory", [])
                 path_id = path_data.get("path_id", "unknown")
+                is_complete = path_data.get("is_complete", False)
             elif hasattr(path_data, "classification_path"):
                 classification_path = path_data.classification_path
                 trajectory = getattr(path_data, "trajectory", [])
                 path_id = path_data.path_id
+                is_complete = getattr(path_data, "is_complete", False)
             else:
+                logger.warning(f"  [rollout] Path {path_idx}: Unknown type {type(path_data)}")
                 continue
+            
+            # DIAGNOSTIC: Log each path's depth
+            if path_idx < 3:  # Only log first 3 to avoid spam
+                path_codes = [s.get("code", "[GRP]") for s in classification_path]
+                logger.info(f"  [rollout] Path {path_idx}: {len(classification_path)} steps, complete={is_complete}, codes={path_codes[:5]}")
             
             pred_trace = build_pred_trace_from_path(classification_path)
             reward_components = {
                 "trace_prefix": compute_leaf_reward(pred_trace, gold_trace),
                 "code_digits_prefix": _code_digits_prefix_reward(pred_trace, gold_code),
             }
-            reward = _aggregate_leaf_reward(reward_components)
+            base_reward = _aggregate_leaf_reward(reward_components)
+            
+            # Apply length penalty to discourage long outputs
+            length_multiplier = _compute_length_penalty(trajectory)
+            reward = base_reward * length_multiplier
+            
+            # Log if penalty applied (INFO level so user can see it working)
+            if length_multiplier < 0.95:
+                logger.info(f"  [rollout] ⚠️ Path {path_id}: LENGTH PENALTY {1-length_multiplier:.0%} applied (reward {base_reward:.3f} → {reward:.3f})")
             
             leaves.append({
                 "path_id": path_id,
                 "pred_trace": pred_trace,
                 "reward": reward,
-                "reward_raw": reward,
+                "reward_raw": base_reward,
                 "reward_components": reward_components,
+                "length_penalty": length_multiplier,
                 "trajectory": trajectory,
                 "classification_path": classification_path,
                 "source": "final_beam",
@@ -1561,14 +1839,19 @@ def run_online_rollout(
                 "trace_prefix": compute_leaf_reward(pred_trace, gold_trace),
                 "code_digits_prefix": _code_digits_prefix_reward(pred_trace, gold_code),
             }
-            reward = _aggregate_leaf_reward(reward_components)
+            base_reward = _aggregate_leaf_reward(reward_components)
+            
+            # Apply length penalty to discourage long outputs
+            length_multiplier = _compute_length_penalty(trajectory)
+            reward = base_reward * length_multiplier
             
             leaves.append({
                 "path_id": path_id,
                 "pred_trace": pred_trace,
                 "reward": reward,
-                "reward_raw": reward,
+                "reward_raw": base_reward,
                 "reward_components": reward_components,
+                "length_penalty": length_multiplier,
                 "trajectory": trajectory,
                 "classification_path": classification_path,
                 "source": "pruned",
@@ -1578,18 +1861,25 @@ def run_online_rollout(
             logger.warning(f"No leaves collected for ruling: {product_description[:50]}")
             return []
         
-        reward_key = "reward"
-        if config.advantage_method and config.advantage_method.lower() == "gdpo" and config.use_gdpo_treerl_rewards:
-            applied = _apply_gdpo_leaf_rewards(
+        # CRITICAL FIX: Always use RAW rewards for TreeRL V(s) computation
+        # GDPO normalization is for advantage-based loss scaling, NOT for value baselines
+        # Per GDPO paper: normalization is applied to advantages, not to replace rewards
+        
+        # Compute GDPO advantages (stored on leaves for optional loss scaling)
+        if config.advantage_method and config.advantage_method.lower() == "gdpo":
+            _compute_gdpo_advantages(
                 leaves,
                 config.gdpo_reward_weights,
                 config.gdpo_eps,
-                config.gdpo_fallback_to_raw,
             )
-            if applied:
-                reward_key = "treerl_reward"
 
-        step_rewards, v_root = compute_treerl_rewards(leaves, reward_key=reward_key)
+        # TreeRL uses RAW rewards for proper V(root) and step reward computation
+        step_rewards, v_root = compute_treerl_rewards(leaves, reward_key="reward")
+        
+        # DIAGNOSTIC: Check trajectory presence before emitting
+        leaves_with_traj = sum(1 for leaf in leaves if leaf.get("trajectory"))
+        if leaves_with_traj < len(leaves):
+            logger.warning(f"  [rollout] ⚠️ Only {leaves_with_traj}/{len(leaves)} leaves have trajectories!")
         
         samples = emit_leaf_samples(
             leaves,
@@ -1598,7 +1888,9 @@ def run_online_rollout(
             gold_code=gold_code,
         )
         
-        logger.debug(f"Rollout: {len(leaves)} leaves, {len(samples)} samples, V(root)={v_root:.3f}")
+        logger.info(f"  [rollout] Rollout: {len(leaves)} leaves, {len(samples)} samples, V(root)={v_root:.3f}")
+        if len(samples) < len(leaves):
+            logger.warning(f"  [rollout] ⚠️ Fewer samples than leaves! Some may lack trajectories.")
         
         return samples
         
@@ -1757,53 +2049,41 @@ def load_training_model(config: TreeRLConfig, logger: logging.Logger, adapter_pa
 
 
 def unload_training_model(model, tokenizer, logger: logging.Logger):
-    """Unload training model and free GPU memory aggressively."""
+    """Unload training model and free GPU memory (gentle approach to avoid crashes)."""
     logger.info("Unloading training model...")
     
-    # Move model to CPU first to release GPU memory
-    try:
-        model.cpu()
-    except Exception:
-        pass
+    # Give GPU time to finish any pending operations
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     
-    # Delete model
+    # Delete model directly (don't move to CPU - can cause issues)
     del model
-    gc.collect()
     gc.collect()
     
     # Delete tokenizer
     del tokenizer
     gc.collect()
     
-    # Aggressive CUDA cleanup
+    # Wait before CUDA cleanup
+    time.sleep(2)
+    
+    # Gentle CUDA cleanup
     if torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        
-        # IPC collect helps release memory from other processes
-        try:
-            torch.cuda.ipc_collect()
-        except Exception:
-            pass
-        
-        # Reset accumulated memory stats
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.reset_accumulated_memory_stats()
-        
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
     
-    # Force Python garbage collection multiple times
-    for _ in range(5):
-        gc.collect()
+    # Light garbage collection
+    gc.collect()
+    gc.collect()
     
-    # Final CUDA cleanup
-    free_gpu_memory(logger)
-    
-    # Wait for memory to actually be released
+    # Wait for memory to stabilize
     time.sleep(3)
     
-    logger.info("Training model unloaded, GPU memory freed")
+    if torch.cuda.is_available():
+        free_mem = torch.cuda.mem_get_info()[0] / 1e9
+        logger.info(f"  GPU memory after unload: {free_mem:.1f}GB free")
+    
+    logger.info("Training model unloaded")
 
 
 def find_assistant_turn_boundaries(
@@ -2015,10 +2295,15 @@ def train_on_samples(
     
     model.train()
 
-    # Compute leaf-level advantages only if explicitly enabled
-    adv_by_path_id = {}
-    if config.apply_leaf_advantage_scaling:
-        adv_by_path_id = _compute_leaf_advantages(samples, config, logger)
+    # GDPO advantages are pre-computed during rollout and stored on samples
+    # Only used if apply_leaf_advantage_scaling is enabled
+    use_gdpo_scaling = config.apply_leaf_advantage_scaling and config.advantage_method == "gdpo"
+    if use_gdpo_scaling:
+        # Log GDPO advantage stats
+        gdpo_advs = [s.get("gdpo_advantage", 0.0) for s in samples if "gdpo_advantage" in s]
+        if gdpo_advs:
+            logger.info(f"  GDPO advantages: mean={sum(gdpo_advs)/len(gdpo_advs):.4f}, "
+                       f"min={min(gdpo_advs):.4f}, max={max(gdpo_advs):.4f}")
     
     metrics = {
         "total_loss": 0.0,
@@ -2036,7 +2321,13 @@ def train_on_samples(
         step_rewards = sample.get("step_rewards", [])
         leaf_reward = sample.get("leaf_reward", sample.get("reward", None))
         path_id = sample.get("path_id", f"idx_{sample_idx}")
-        leaf_advantage = float(adv_by_path_id.get(path_id, 1.0)) if adv_by_path_id else 1.0
+        
+        # GDPO advantage is pre-computed during rollout
+        # Per TreeRL/GDPO papers: negative advantages are CORRECT
+        # They signal "decrease probability of this path" (gradient descent on negative loss)
+        gdpo_adv = sample.get("gdpo_advantage", 0.0)
+        # Clamp to prevent extreme scaling (stabilization)
+        leaf_advantage = max(-3.0, min(3.0, gdpo_adv)) if use_gdpo_scaling else 1.0
         
         if not messages:
             continue
@@ -2085,8 +2376,8 @@ def train_on_samples(
                 messages=messages,
             )
 
-            # Apply leaf-level advantage scaling (optional)
-            if config.apply_leaf_advantage_scaling:
+            # Apply GDPO leaf-level advantage scaling (optional)
+            if use_gdpo_scaling:
                 loss = loss * leaf_advantage
             
             scaled_loss = loss / config.gradient_accumulation_steps
@@ -2270,9 +2561,14 @@ def _compute_leaf_advantages(
 # ACCURACY METRICS
 # ============================================================================
 
-def compute_batch_accuracy(samples: List[Dict], logger: logging.Logger) -> Dict[str, float]:
+def compute_batch_accuracy(samples: List[Dict], logger: logging.Logger, quiet: bool = False) -> Dict[str, float]:
     """
     Compute accuracy metrics for a batch of samples.
+    
+    Args:
+        samples: List of sample dictionaries
+        logger: Logger instance
+        quiet: If True, don't log anything (for internal calculations)
     
     Returns:
         Dict with:
@@ -2407,26 +2703,41 @@ def init_wandb(config: TreeRLConfig, logger: logging.Logger) -> Optional[Any]:
         
         run_name = config.wandb_run_name or f"treerl-ch{config.chapter}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
-        wandb.init(
-            project=config.wandb_project,
-            entity=config.wandb_entity if config.wandb_entity else None,
-            name=run_name,
-            config={
-                "base_model": config.base_model,
-                "chapter": config.chapter,
-                "rulings_per_batch": config.rulings_per_batch,
-                "num_batches": config.num_batches,
-                "num_epochs": config.num_epochs,
-                "beam_size": config.beam_size,
-                "lora_rank": config.lora_rank,
-                "lora_alpha": config.lora_alpha,
-                "learning_rate": config.learning_rate,
-                "advantage_method": config.advantage_method,
-                "gdpo_reward_weights": config.gdpo_reward_weights,
-                "leaf_reward_weights": config.leaf_reward_weights,
-            },
-        )
-        logger.info(f"✓ Wandb initialized: {run_name}")
+        wandb_config = {
+            "base_model": config.base_model,
+            "chapter": config.chapter,
+            "rulings_per_batch": config.rulings_per_batch,
+            "num_batches": config.num_batches,
+            "num_epochs": config.num_epochs,
+            "beam_size": config.beam_size,
+            "lora_rank": config.lora_rank,
+            "lora_alpha": config.lora_alpha,
+            "learning_rate": config.learning_rate,
+            "advantage_method": config.advantage_method,
+            "gdpo_reward_weights": config.gdpo_reward_weights,
+            "leaf_reward_weights": config.leaf_reward_weights,
+        }
+        
+        # Support resuming a previous run
+        if config.wandb_resume and config.wandb_run_id:
+            logger.info(f"📊 Resuming wandb run: {config.wandb_run_id}")
+            wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity if config.wandb_entity else None,
+                id=config.wandb_run_id,
+                resume="must",  # Fail if run doesn't exist
+                config=wandb_config,
+            )
+            logger.info(f"✓ Wandb resumed: {config.wandb_run_id}")
+        else:
+            wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity if config.wandb_entity else None,
+                name=run_name,
+                config=wandb_config,
+            )
+            logger.info(f"✓ Wandb initialized: {run_name}")
+        
         return wandb
     except ImportError:
         logger.warning("wandb not installed. Run: pip install wandb")
@@ -2523,8 +2834,44 @@ def train(config: TreeRLConfig):
         logger.info(f"  Number of epochs: {config.num_epochs}")
         logger.info(f"  Total batches: {num_batches_per_epoch * config.num_epochs}")
     
-    # Initialize paths
-    current_adapter_path = config.sft_adapter if config.sft_adapter else None
+    # Initialize paths - handle HuggingFace adapter download
+    current_adapter_path = None
+    if config.sft_adapter:
+        if os.path.isdir(config.sft_adapter):
+            # Local path
+            current_adapter_path = config.sft_adapter
+            logger.info(f"📦 Using local SFT adapter: {current_adapter_path}")
+        elif "/" in config.sft_adapter and not config.sft_adapter.startswith("/"):
+            # HuggingFace repo ID (e.g., "orlandowhite/qwen3_sft")
+            logger.info(f"📦 Downloading SFT adapter from HuggingFace: {config.sft_adapter}")
+            try:
+                from huggingface_hub import snapshot_download
+                
+                # Download to a local cache dir
+                hf_cache_dir = os.path.join(config.adapter_sync_dir, "hf_sft_adapter")
+                os.makedirs(hf_cache_dir, exist_ok=True)
+                
+                current_adapter_path = snapshot_download(
+                    repo_id=config.sft_adapter,
+                    local_dir=hf_cache_dir,
+                    local_dir_use_symlinks=False,
+                )
+                logger.info(f"  ✓ Downloaded to: {current_adapter_path}")
+                
+                # Verify it's a valid adapter
+                adapter_config = os.path.join(current_adapter_path, "adapter_config.json")
+                if os.path.exists(adapter_config):
+                    logger.info(f"  ✓ Valid LoRA adapter found")
+                else:
+                    logger.warning(f"  ⚠️ No adapter_config.json found, may not be a LoRA adapter")
+                    
+            except Exception as e:
+                logger.error(f"❌ Failed to download HuggingFace adapter: {e}")
+                logger.warning(f"  Continuing without SFT adapter...")
+                current_adapter_path = None
+        else:
+            logger.warning(f"⚠️ SFT adapter path not found: {config.sft_adapter}")
+            current_adapter_path = None
     
     # Initialize vLLM server manager
     vllm_manager = VLLMServerManager(config, logger)
@@ -2543,7 +2890,11 @@ def train(config: TreeRLConfig):
     
     training_start = time.time()
     all_metrics = []
-    global_batch_num = 0  # Global batch counter across all epochs
+    global_batch_num = config.start_batch  # Start from specified batch (for resuming)
+    
+    if config.start_batch > 0:
+        logger.info(f"\n⏭️  RESUMING from batch {config.start_batch}")
+        logger.info(f"   Skipping first {config.start_batch} batches")
     
     # =============================================
     # INITIAL BASELINE BENCHMARK (before any training)
@@ -2606,6 +2957,13 @@ def train(config: TreeRLConfig):
         
         for batch_num in range(num_batches_per_epoch):
             global_batch_num += 1
+            
+            # Skip batches if resuming from a later position
+            if global_batch_num <= config.start_batch:
+                if global_batch_num == config.start_batch:
+                    logger.info(f"⏭️  Skipped to batch {config.start_batch}, starting training...")
+                continue
+            
             batch_start = time.time()
             
             logger.info(f"\n{'─' * 50}")
@@ -2894,16 +3252,49 @@ def train(config: TreeRLConfig):
             }
             all_metrics.append(batch_metrics)
             
-            # Log to wandb
-            log_to_wandb(wandb_run, {
+            # Log to wandb with comprehensive metrics
+            wandb_metrics = {
+                # Training metrics
                 "loss": avg_loss,
-                "exact_match_rate": accuracy_metrics['exact_match_rate'],
-                "num_exact_matches": accuracy_metrics['num_exact_matches'],
-                "avg_best_reward": accuracy_metrics['avg_best_reward'],
-                "avg_reward": accuracy_metrics['avg_reward'],
                 "num_samples": train_metrics.get("num_samples", 0),
                 "num_rulings": len(batch_rulings),
-            }, step=global_batch_num, prefix="batch")
+                "skipped_truncated": train_metrics.get("skipped_truncated", 0),
+                "skipped_error": train_metrics.get("skipped_error", 0),
+                # Current batch accuracy (noisy but immediate signal)
+                "batch_exact_match_rate": current_batch_accuracy['exact_match_rate'],
+                "batch_avg_best_reward": current_batch_accuracy['avg_best_reward'],
+            }
+            
+            # Log multiple rolling window accuracies for diagnostic comparison
+            for window_size in config.accuracy_window_sizes:
+                # Compute accuracy over this window size
+                gold_codes_for_window = unique_gold_codes[-window_size:] if len(unique_gold_codes) >= window_size else unique_gold_codes
+                samples_for_window = [s for s in accuracy_rolling_samples if s.get("gold_code") in gold_codes_for_window]
+                
+                if samples_for_window:
+                    window_metrics = compute_batch_accuracy(samples_for_window, logger, quiet=True)
+                    wandb_metrics[f"rolling_{window_size}_exact_match_rate"] = window_metrics['exact_match_rate']
+                    wandb_metrics[f"rolling_{window_size}_avg_best_reward"] = window_metrics['avg_best_reward']
+                    wandb_metrics[f"rolling_{window_size}_avg_reward"] = window_metrics['avg_reward']
+            
+            # Reward distribution for current batch (diagnostic)
+            if all_batch_samples:
+                rewards = [s.get("reward", 0) for s in all_batch_samples]
+                best_rewards_per_ruling = {}
+                for s in all_batch_samples:
+                    gold = s.get("gold_code", "unknown")
+                    r = s.get("reward", 0)
+                    best_rewards_per_ruling[gold] = max(best_rewards_per_ruling.get(gold, 0), r)
+                
+                wandb_metrics["reward_mean"] = sum(rewards) / len(rewards) if rewards else 0
+                wandb_metrics["reward_max"] = max(rewards) if rewards else 0
+                wandb_metrics["reward_min"] = min(rewards) if rewards else 0
+                wandb_metrics["reward_std"] = (sum((r - wandb_metrics["reward_mean"])**2 for r in rewards) / len(rewards))**0.5 if len(rewards) > 1 else 0
+                
+                best_rs = list(best_rewards_per_ruling.values())
+                wandb_metrics["best_reward_mean"] = sum(best_rs) / len(best_rs) if best_rs else 0
+            
+            log_to_wandb(wandb_run, wandb_metrics, step=global_batch_num, prefix="train")
             
             # =============================================
             # BENCHMARK EVALUATION (every N batches)
@@ -3044,8 +3435,8 @@ def main():
                        default="",
                        help="Model for vLLM inference (default: same as base-model). Use FP8 variant for faster inference, e.g. Qwen/Qwen3-14B-FP8")
     parser.add_argument("--sft-adapter", type=str, 
-                       default="",
-                       help="Starting LoRA adapter path (optional)")
+                       default="treerl_checkpoints/adapter_sync/adapter_1768520829",
+                       help="Starting LoRA adapter path")
     parser.add_argument("--max-seq-length", type=int, default=131072,
                        help="Max context length for vLLM (131072 with YaRN, 32768 native)")
     parser.add_argument("--train-max-seq-length", type=int, default=131072,
@@ -3060,22 +3451,24 @@ def main():
     # Qwen3 thinking mode
     parser.add_argument("--no-thinking", action="store_true",
                        help="Disable Qwen3 thinking mode")
+    parser.add_argument("--json-thinking", action="store_true",
+                       help="Enable thinking for JSON responses (more tokens but may improve quality)")
     
     # vLLM args
     parser.add_argument("--vllm-port", type=int, default=8000,
                        help="vLLM server port")
-    parser.add_argument("--vllm-gpu-util", type=float, default=0.85,
-                       help="vLLM GPU memory utilization (0.85 recommended for stability)")
+    parser.add_argument("--vllm-gpu-util", type=float, default=0.80,
+                       help="vLLM GPU memory utilization")
     parser.add_argument("--no-vllm-lora", action="store_true",
                        help="Disable vLLM LoRA support")
     parser.add_argument("--vllm-reasoning-parser", type=str, default="",
                        help="vLLM reasoning parser (leave empty for compatibility, or try 'deepseek_r1')")
     
     # LoRA args
-    parser.add_argument("--lora-rank", type=int, default=32,
-                       help="LoRA rank")
-    parser.add_argument("--lora-alpha", type=int, default=64,
-                       help="LoRA alpha")
+    parser.add_argument("--lora-rank", type=int, default=64,
+                       help="LoRA rank (must match SFT adapter)")
+    parser.add_argument("--lora-alpha", type=int, default=128,
+                       help="LoRA alpha (typically 2x rank)")
     
     # Training args
     parser.add_argument("--lr", type=float, default=5e-5,
@@ -3092,6 +3485,8 @@ def main():
                        help="Number of batches per epoch")
     parser.add_argument("--epochs", type=int, default=3,
                        help="Number of epochs")
+    parser.add_argument("--start-batch", type=int, default=0,
+                       help="Skip to this batch number (for resuming mid-training)")
 
     # Advantage normalization
     parser.add_argument("--advantage-method", type=str, default="gdpo",
@@ -3101,14 +3496,10 @@ def main():
                        help="GDPO reward component weights")
     parser.add_argument("--leaf-reward-weights", type=str, default="0.85,0.15",
                        help="Leaf reward aggregation weights")
-    parser.add_argument("--no-gdpo-treerl-rewards", action="store_true",
-                       help="Disable GDPO-style decoupled rewards before TreeRL")
     parser.add_argument("--gdpo-eps", type=float, default=1e-6,
                        help="GDPO normalization epsilon")
-    parser.add_argument("--no-gdpo-fallback", action="store_true",
-                       help="Disable fallback to raw rewards when GDPO collapses")
-    parser.add_argument("--apply-leaf-advantage", action="store_true",
-                       help="Scale loss by per-leaf advantages (optional)")
+    parser.add_argument("--no-gdpo-scaling", action="store_true",
+                       help="Disable GDPO advantage scaling (uses raw TreeRL R(s) only)")
     
     # Data args
     parser.add_argument("--chapter", type=str, default="84",
@@ -3128,19 +3519,23 @@ def main():
                        help="Wandb run name (auto-generated if empty)")
     parser.add_argument("--wandb-entity", type=str, default="",
                        help="Wandb entity (username/team)")
+    parser.add_argument("--wandb-resume", action="store_true",
+                       help="Resume a previous wandb run")
+    parser.add_argument("--wandb-run-id", type=str, default="",
+                       help="Wandb run ID to resume (e.g., 'fr6uebpz')")
     
     # TreeRL args
     parser.add_argument("--beam-size", type=int, default=4,
                        help="Beam size for rollouts")
-    parser.add_argument("--max-questions", type=int, default=3,
+    parser.add_argument("--max-questions", type=int, default=5,
                        help="Max Q&A turns per rollout")
-    parser.add_argument("--parallel-rollouts", type=int, default=4,
+    parser.add_argument("--parallel-rollouts", type=int, default=8,
                        help="Number of rulings to process concurrently (vLLM batches internally)")
     
     # Benchmark evaluation
-    parser.add_argument("--benchmark-every", type=int, default=50,
+    parser.add_argument("--benchmark-every", type=int, default=0,
                        help="Run benchmark evaluation every N batches (0 to disable)")
-    parser.add_argument("--benchmark-rulings", type=int, default=30,
+    parser.add_argument("--benchmark-rulings", type=int, default=0,
                        help="Number of held-out rulings for benchmark evaluation")
     
     # Output args
@@ -3169,6 +3564,7 @@ def main():
         load_in_4bit=not args.no_4bit,
         yarn_factor=args.yarn_factor,
         enable_thinking=not args.no_thinking,
+        json_thinking=args.json_thinking,
         vllm_port=args.vllm_port,
         vllm_gpu_memory_utilization=args.vllm_gpu_util,
         vllm_enable_lora=not args.no_vllm_lora,
@@ -3181,13 +3577,12 @@ def main():
         accuracy_window_size=args.accuracy_window,
         num_batches=args.num_batches,
         num_epochs=args.epochs,
+        start_batch=args.start_batch,
         advantage_method=args.advantage_method,
         gdpo_reward_weights=tuple(float(x.strip()) for x in args.gdpo_reward_weights.split(",") if x.strip()),
         leaf_reward_weights=tuple(float(x.strip()) for x in args.leaf_reward_weights.split(",") if x.strip()),
-        use_gdpo_treerl_rewards=not args.no_gdpo_treerl_rewards,
         gdpo_eps=args.gdpo_eps,
-        gdpo_fallback_to_raw=not args.no_gdpo_fallback,
-        apply_leaf_advantage_scaling=args.apply_leaf_advantage,
+        apply_leaf_advantage_scaling=not args.no_gdpo_scaling,
         chapter=args.chapter,
         cross_rulings_file=args.cross_rulings_file,
         train_all=args.train_all,
@@ -3204,6 +3599,8 @@ def main():
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,
         wandb_entity=args.wandb_entity,
+        wandb_resume=args.wandb_resume,
+        wandb_run_id=args.wandb_run_id,
         # CRITICAL: External vLLM architecture
         use_fast_inference=False,
     )
