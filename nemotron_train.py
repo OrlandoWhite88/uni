@@ -21,14 +21,15 @@ os.environ.setdefault("VLLM_TARGET_DEVICE", "cuda")
 """
 TreeRL GRPO Training Script with NVIDIA Nemotron-3-Nano-30B-A3B (vLLM + Unsloth)
 
-ARCHITECTURE (NO vLLM LoRA):
+ARCHITECTURE (vLLM LoRA - PR #30802):
 - vLLM runs as external server for rollouts (high throughput inference)
 - Unsloth loads separately for training (fast_inference=False)
-- Since vLLM LoRA is not supported/used for this model, we:
-    * Merge the latest LoRA adapter into a BF16 base checkpoint
-    * Start vLLM on the merged checkpoint directory
+- vLLM serves base BF16 model with LoRA adapter via --enable-lora --lora-modules:
+    * Start vLLM with base model + current LoRA adapter
+    * Run rollouts via vLLM (uses LoRA adapter)
     * Stop vLLM before training
-    * Train next LoRA adapter
+    * Train next LoRA adapter with Unsloth
+    * Restart vLLM with updated LoRA adapter
     * Repeat
 
 Nemotron-3-Nano reasoning:
@@ -169,7 +170,7 @@ class TreeRLConfig:
     max_grad_norm: float = 1.0
 
     # Advantage shaping / normalization
-    advantage_method: str = "gdpo"  # none | grpo | grpo_no_std | gdpo
+    advantage_method: str = "none"  # none | grpo | grpo_no_std | gdpo
     gdpo_reward_weights: Tuple[float, ...] = (1.0, 1.0)
 
     # TreeRL settings
@@ -230,6 +231,12 @@ class TreeRLConfig:
 
     # Safety margin for max_tokens calculation
     token_safety_margin: int = 512
+
+    # vLLM LoRA serving (PR #30802)
+    # When True, vLLM serves base model with LoRA adapter via --enable-lora
+    # When False (legacy), merges LoRA into base model before serving
+    use_vllm_lora: bool = True
+    vllm_lora_name: str = "current_adapter"  # Name used in --lora-modules and API requests
 
 
 # ============================================================================
@@ -395,7 +402,7 @@ def merge_lora_into_bf16_base(
 # ============================================================================
 
 class VLLMServerManager:
-    """Manages vLLM server lifecycle (NO LoRA)."""
+    """Manages vLLM server lifecycle with LoRA support (PR #30802)."""
 
     def __init__(self, config: TreeRLConfig, logger: logging.Logger):
         self.config = config
@@ -405,6 +412,7 @@ class VLLMServerManager:
         self._log_thread: Optional[threading.Thread] = None
         self._stop_logging = threading.Event()
         self._log_file_path = os.path.join(config.output_dir, "vllm_server.log")
+        self._current_lora_path: Optional[str] = None  # Track current LoRA adapter path
 
     def _ensure_reasoning_parser_plugin(self) -> Optional[str]:
         """
@@ -434,9 +442,13 @@ class VLLMServerManager:
             self.logger.warning(f"  ⚠️ Could not download reasoning parser plugin ({e}). Continuing without it.")
             return None
 
-    def start_server(self, model_to_serve: str) -> bool:
+    def start_server(self, model_to_serve: str, lora_adapter_path: Optional[str] = None) -> bool:
         """
         Start vLLM server serving model_to_serve (HF id or local dir).
+        
+        Args:
+            model_to_serve: Base model HF id or local path
+            lora_adapter_path: Optional LoRA adapter path (used when use_vllm_lora=True)
         """
         if self.is_running():
             self.logger.info("vLLM server already running")
@@ -469,6 +481,20 @@ class VLLMServerManager:
             "--max-model-len", str(self.config.vllm_max_model_len),
             "--served-model-name", self.config.vllm_served_model_name,
         ]
+
+        # vLLM LoRA support (PR #30802)
+        if self.config.use_vllm_lora and lora_adapter_path:
+            self._current_lora_path = lora_adapter_path
+            # --enable-lora enables LoRA adapter support
+            # --lora-modules format: name=path (can specify multiple)
+            lora_module_spec = f"{self.config.vllm_lora_name}={lora_adapter_path}"
+            cmd.extend([
+                "--enable-lora",
+                "--lora-modules", lora_module_spec,
+            ])
+            self.logger.info(f"  LoRA enabled: {lora_module_spec}")
+        else:
+            self._current_lora_path = None
 
         # Optional tool-calling + reasoning parser plugin flags (per NVIDIA guide)
         if self.config.vllm_enable_auto_tool_choice:
@@ -612,7 +638,12 @@ class VLLMInferenceClient:
         self.log_prompts = False
         self.prompt_logger = logger
         self.client = None
-        self.model_name = config.vllm_served_model_name
+        # When using vLLM LoRA, use the LoRA adapter name for API requests
+        # This tells vLLM to use the LoRA adapter instead of base model
+        if config.use_vllm_lora and server_manager._current_lora_path:
+            self.model_name = config.vllm_lora_name
+        else:
+            self.model_name = config.vllm_served_model_name
 
         self._json_requirements = (
             "\n\n=== OUTPUT FORMAT ===\n"
@@ -800,7 +831,7 @@ class VLLMInferenceClient:
         effective_top_p = self.config.rollout_top_p
 
         payload = {
-            "model": self.config.vllm_served_model_name,
+            "model": self.model_name,
             "messages": messages,
             "max_tokens": safe_max_tokens,
             "temperature": effective_temp,
@@ -2071,20 +2102,28 @@ def train(config: TreeRLConfig):
         # For baseline, we need to start vLLM with the initial model/adapter
         base_for_serve = config.base_model_fp8 if config.inference_dtype.lower() == "fp8" else config.base_model_bf16
 
-        if current_adapter_path:
-            # Merge adapter for baseline
-            merged_dir = os.path.join(config.merged_models_dir, "merged_baseline")
-            _safe_rmtree(merged_dir)
-            baseline_model = merge_lora_into_bf16_base(
-                base_model_id=config.base_model_bf16,
-                adapter_path=current_adapter_path,
-                merged_out_dir=merged_dir,
-                logger=logger,
-            )
-        else:
+        if config.use_vllm_lora:
+            # vLLM LoRA mode: serve base model with LoRA adapter
             baseline_model = base_for_serve
+            baseline_lora = current_adapter_path  # May be None if no adapter yet
+            logger.info(f"  Using vLLM LoRA mode: base={baseline_model}, lora={baseline_lora}")
+        else:
+            # Legacy merge mode
+            baseline_lora = None
+            if current_adapter_path:
+                # Merge adapter for baseline
+                merged_dir = os.path.join(config.merged_models_dir, "merged_baseline")
+                _safe_rmtree(merged_dir)
+                baseline_model = merge_lora_into_bf16_base(
+                    base_model_id=config.base_model_bf16,
+                    adapter_path=current_adapter_path,
+                    merged_out_dir=merged_dir,
+                    logger=logger,
+                )
+            else:
+                baseline_model = base_for_serve
 
-        if vllm_manager.start_server(model_to_serve=baseline_model):
+        if vllm_manager.start_server(model_to_serve=baseline_model, lora_adapter_path=baseline_lora):
             baseline_client = VLLMInferenceClient(config, logger, vllm_manager)
 
             baseline_metrics = run_benchmark_evaluation(
@@ -2160,41 +2199,55 @@ def train(config: TreeRLConfig):
                     batch_rulings = random.sample(rulings, min(config.rulings_per_batch, len(rulings)))
 
                 # =========================================================
-                # PHASE 1: PREPARE MODEL TO SERVE (MERGE if adapter exists)
+                # PHASE 1: PREPARE MODEL TO SERVE
                 # =========================================================
                 logger.info(f"\n--- Phase 1: Preparing model for vLLM ---")
 
-                # Choose base model for merge/serve
-                base_for_merge = config.base_model_bf16  # always merge into BF16
+                # Choose base model for serve
                 base_for_serve = config.base_model_fp8 if config.inference_dtype.lower() == "fp8" else config.base_model_bf16
 
-                if current_adapter_path:
-                    logger.info(f"  Current adapter: {current_adapter_path}")
-
-                    # Create unique merged dir per batch
-                    merged_dir = os.path.join(config.merged_models_dir, f"merged_e{epoch+1}_b{batch_num+1}")
-                    _safe_rmtree(merged_dir)
-
-                    # Merge adapter into BF16 base (recommended)
-                    merged_model_dir = merge_lora_into_bf16_base(
-                        base_model_id=base_for_merge,
-                        adapter_path=current_adapter_path,
-                        merged_out_dir=merged_dir,
-                        logger=logger,
-                    )
-
-                    # Serve merged BF16 dir (most robust)
-                    model_to_serve = merged_model_dir
-                    logger.info(f"  Serving merged checkpoint dir: {model_to_serve}")
-                else:
+                if config.use_vllm_lora:
+                    # vLLM LoRA mode (PR #30802): serve base model with LoRA adapter
                     model_to_serve = base_for_serve
-                    logger.info(f"  No adapter yet; serving base model: {model_to_serve}")
+                    lora_to_serve = current_adapter_path  # May be None if no adapter yet
+                    if current_adapter_path:
+                        logger.info(f"  vLLM LoRA mode: base={model_to_serve}")
+                        logger.info(f"  LoRA adapter: {current_adapter_path}")
+                    else:
+                        logger.info(f"  No adapter yet; serving base model: {model_to_serve}")
+                else:
+                    # Legacy merge mode
+                    lora_to_serve = None
+                    base_for_merge = config.base_model_bf16  # always merge into BF16
+
+                    if current_adapter_path:
+                        logger.info(f"  Current adapter: {current_adapter_path}")
+
+                        # Create unique merged dir per batch
+                        merged_dir = os.path.join(config.merged_models_dir, f"merged_e{epoch+1}_b{batch_num+1}")
+                        _safe_rmtree(merged_dir)
+
+                        # Merge adapter into BF16 base (recommended)
+                        merged_model_dir = merge_lora_into_bf16_base(
+                            base_model_id=base_for_merge,
+                            adapter_path=current_adapter_path,
+                            merged_out_dir=merged_dir,
+                            logger=logger,
+                        )
+
+                        # Serve merged BF16 dir (most robust)
+                        model_to_serve = merged_model_dir
+                        logger.info(f"  Serving merged checkpoint dir: {model_to_serve}")
+                    else:
+                        model_to_serve = base_for_serve
+                        logger.info(f"  No adapter yet; serving base model: {model_to_serve}")
 
                 # =========================================================
                 # PHASE 2: START vLLM
                 # =========================================================
                 logger.info(f"\n--- Phase 2: Starting vLLM server ---")
-                if not vllm_manager.start_server(model_to_serve=model_to_serve):
+                lora_path_for_server = lora_to_serve if config.use_vllm_lora else None
+                if not vllm_manager.start_server(model_to_serve=model_to_serve, lora_adapter_path=lora_path_for_server):
                     logger.error("Failed to start vLLM server!")
                     return
 
@@ -2366,22 +2419,31 @@ def train(config: TreeRLConfig):
 
                 logger.info(f"\n--- Running Benchmark Evaluation (batch {global_batch_num}) ---")
 
-                # Merge current adapter for benchmark
-                benchmark_merged_dir = os.path.join(config.merged_models_dir, f"merged_benchmark_b{global_batch_num}")
-                _safe_rmtree(benchmark_merged_dir)
+                base_for_serve = config.base_model_fp8 if config.inference_dtype.lower() == "fp8" else config.base_model_bf16
 
-                if current_adapter_path:
-                    benchmark_model = merge_lora_into_bf16_base(
-                        base_model_id=config.base_model_bf16,
-                        adapter_path=current_adapter_path,
-                        merged_out_dir=benchmark_merged_dir,
-                        logger=logger,
-                    )
+                if config.use_vllm_lora:
+                    # vLLM LoRA mode: serve base model with LoRA adapter
+                    benchmark_model = base_for_serve
+                    benchmark_lora = current_adapter_path
+                    logger.info(f"  vLLM LoRA benchmark: base={benchmark_model}, lora={benchmark_lora}")
                 else:
-                    benchmark_model = config.base_model_fp8 if config.inference_dtype.lower() == "fp8" else config.base_model_bf16
+                    # Legacy merge mode
+                    benchmark_lora = None
+                    benchmark_merged_dir = os.path.join(config.merged_models_dir, f"merged_benchmark_b{global_batch_num}")
+                    _safe_rmtree(benchmark_merged_dir)
+
+                    if current_adapter_path:
+                        benchmark_model = merge_lora_into_bf16_base(
+                            base_model_id=config.base_model_bf16,
+                            adapter_path=current_adapter_path,
+                            merged_out_dir=benchmark_merged_dir,
+                            logger=logger,
+                        )
+                    else:
+                        benchmark_model = base_for_serve
 
                 # Start vLLM for benchmark
-                if vllm_manager.start_server(model_to_serve=benchmark_model):
+                if vllm_manager.start_server(model_to_serve=benchmark_model, lora_adapter_path=benchmark_lora if config.use_vllm_lora else None):
                     benchmark_client = VLLMInferenceClient(config, logger, vllm_manager)
 
                     benchmark_metrics = run_benchmark_evaluation(
@@ -2510,6 +2572,10 @@ def main():
     # LoRA args
     parser.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
     parser.add_argument("--lora-alpha", type=int, default=64, help="LoRA alpha")
+    parser.add_argument("--no-vllm-lora", action="store_true",
+                        help="Disable vLLM LoRA (use legacy merge architecture instead)")
+    parser.add_argument("--vllm-lora-name", type=str, default="current_adapter",
+                        help="Name for LoRA adapter in vLLM --lora-modules")
 
     # Training args
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
@@ -2530,7 +2596,7 @@ def main():
     parser.add_argument("--benchmark-num-rulings", type=int, default=50, help="Number of held-out rulings for benchmark")
 
     # Advantage normalization
-    parser.add_argument("--advantage-method", type=str, default="gdpo",
+    parser.add_argument("--advantage-method", type=str, default="none",
                         choices=["none", "grpo", "grpo_no_std", "gdpo"])
     parser.add_argument("--gdpo-reward-weights", type=str, default="1.0,1.0")
 
@@ -2575,6 +2641,8 @@ def main():
         vllm_use_reasoning_parser=not args.no_reasoning_parser,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
+        use_vllm_lora=not args.no_vllm_lora,
+        vllm_lora_name=args.vllm_lora_name,
         learning_rate=args.lr,
         gradient_accumulation_steps=args.grad_accum,
         rulings_per_batch=args.rulings_per_batch,
