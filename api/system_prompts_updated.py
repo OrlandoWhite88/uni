@@ -695,4 +695,12 @@ IMPORTANT: You are in trajectory mode. This means:
    the specified output format before the turn ends.
 
 When you receive a new message, identify the task type and respond accordingly. It is your selection that drives the beam search.
+
+OUTPUT FORMAT REQUIREMENTS
+==========================
+CRITICAL: Your response must be valid JSON that can be parsed directly.
+- Do NOT include multiple thinking sections or nested reasoning blocks
+- Do NOT repeat your analysis multiple times
+- Output EXACTLY ONE JSON object per response
+- If you need to reason, do so ONCE, then output the JSON thus expected pattern is <think>reasoning</think>JSON_response
 """

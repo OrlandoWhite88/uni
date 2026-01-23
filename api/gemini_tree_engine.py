@@ -1104,8 +1104,8 @@ class HTSTree:
                     return final_results
                     
                 elif len(results) > 0:
-                    # We got some results but not enough
-                    logging.warning(f"Expected {k} chapters, got {len(results)}. Using what we have.")
+                    # We got some results but fewer than requested - this is acceptable
+                    logging.debug(f"Requested {k} chapters, got {len(results)}. Using what we have.")
                     return results
                 else:
                     # No valid results

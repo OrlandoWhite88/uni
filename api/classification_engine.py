@@ -16,6 +16,7 @@ from .notes_loader import (
     load_chapter_context,
     extract_chapter_from_node,
     extract_chapter_from_path,
+    get_chapters_for_section,
 )
 from .prompt_builder import (
     build_system_prompt,
@@ -37,7 +38,7 @@ class RetryableLLMError(RuntimeError):
 
 # Beam search configuration - adjust these values to experiment
 # These can be overridden via environment variables for TreeRL training (k=8 recommended)
-CHAPTER_BEAM_SIZE = int(os.environ.get("TREERL_CHAPTER_BEAM_SIZE", "6"))  # Number of chapters to request from LLM
+CHAPTER_BEAM_SIZE = int(os.environ.get("TREERL_CHAPTER_BEAM_SIZE", "3"))  # Number of chapters to request from LLM
 CLASSIFICATION_BEAM_SIZE = int(os.environ.get("TREERL_BEAM_SIZE", "3"))  # Beam size for heading/subheading/tariff
 
 # Confidence threshold configuration
@@ -109,10 +110,13 @@ class ClassificationEngine:
 
     def determine_top_chapters(self, product_description: str, k: int = CHAPTER_BEAM_SIZE, diagnosis: Optional[str] = None, state: Dict = None) -> List[Tuple[str, float, str]]:
         """
-        Two-stage chapter selection with notes consultation.
+        Two-stage chapter selection with notes consultation (token-efficient version).
         
-        Stage 1: Select initial candidates WITHOUT notes (fast, broad selection)
+        Stage 1: Select top K candidates WITHOUT notes (fast, broad selection)
         Stage 2: Re-evaluate with specific chapter notes for selected chapters (refined selection)
+        
+        After Stage 2, trajectory is cleaned to remove notes for unselected chapters,
+        keeping only the notes for final selected chapters to reduce token bloat downstream.
         
         When TRAJECTORY_MODE is enabled, captures the LLM calls for later inclusion in path trajectories.
         """
@@ -120,11 +124,10 @@ class ClassificationEngine:
         if state is not None and TRAJECTORY_MODE:
             state["_chapter_selection_trajectory"] = []
         
-        # Stage 1: Initial selection WITHOUT notes
-        logging.info("=== STAGE 1: Initial chapter selection (no notes) ===")
-        stage1_k = 6  # Always request top 6 chapters in stage 1
+        # Stage 1: Initial selection WITHOUT notes - select K chapters directly
+        logging.info(f"=== STAGE 1: Initial chapter selection (no notes, k={k}) ===")
         stage1_chapters = self._select_chapters_stage1(
-            product_description, stage1_k, diagnosis, state
+            product_description, k, diagnosis, state
         )
         
         if not stage1_chapters:
@@ -133,8 +136,8 @@ class ClassificationEngine:
         
         logging.info(f"Stage 1 selected {len(stage1_chapters)} chapters: {[ch[0] for ch in stage1_chapters]}")
         
-        # Stage 2: Re-evaluate with section + chapter notes for the 6 selected chapters
-        logging.info("=== STAGE 2: Refined selection with section + chapter notes ===")
+        # Stage 2: Re-evaluate with section + chapter notes for the selected chapters
+        logging.info(f"=== STAGE 2: Refined selection with section + chapter notes ===")
         selected_chapter_nums = [int(ch[0]) for ch in stage1_chapters]
         relevant_notes = load_relevant_notes_for_chapters(selected_chapter_nums)
         if LOG_PROMPT_DEBUG:
@@ -144,18 +147,125 @@ class ClassificationEngine:
                 logging.info(f"   Contains: {', '.join(labels)}")
             self._log_prompt_to_file("STAGE_2_NOTES", relevant_notes)
         
-        stage2_k = 3  # Always select top 3 chapters in stage 2
         final_chapters = self._select_chapters_stage2(
-            product_description, stage2_k, stage1_chapters, relevant_notes, diagnosis, state
+            product_description, k, stage1_chapters, relevant_notes, diagnosis, state
         )
         
         if final_chapters:
             logging.info(f"Stage 2 final selection: {[ch[0] for ch in final_chapters]}")
+            # Note: Trajectory cleanup happens in initialize_classification_paths
+            # Each path gets cleaned to only have its own chapter's notes
             return final_chapters
         
         # Fallback to stage 1 results if stage 2 fails
         logging.warning("Stage 2 failed, using Stage 1 results")
-        return stage1_chapters[:stage2_k]
+        return stage1_chapters[:k]
+    
+    def _clean_trajectory_notes_for_chapter(self, trajectory: List[Dict], keep_chapters: set) -> List[Dict]:
+        """
+        Clean trajectory to remove notes for chapters not needed by this path.
+        Returns a new list with cleaned messages.
+        
+        Args:
+            trajectory: List of message dicts from chapter selection
+            keep_chapters: Set of chapter numbers to keep notes for (typically just one)
+            
+        Returns:
+            Cleaned trajectory with only the relevant chapter's notes
+        """
+        if not trajectory:
+            return []
+        
+        cleaned_trajectory = []
+        for msg in trajectory:
+            content = msg.get("content", "")
+            role = msg.get("role", "")
+            
+            if role == "user" and "RELEVANT NOTES" in content:
+                # This is the Stage 2 user message with notes - clean it
+                cleaned_content = self._filter_notes_content(content, keep_chapters)
+                cleaned_trajectory.append({"role": role, "content": cleaned_content})
+                logging.debug(f"Cleaned trajectory notes for chapters {keep_chapters}: {len(content)} -> {len(cleaned_content)} chars")
+            else:
+                cleaned_trajectory.append(msg.copy())
+        
+        return cleaned_trajectory
+    
+    def _filter_notes_content(self, content: str, keep_chapters: set) -> str:
+        """
+        Filter notes content to only keep notes for specified chapters.
+        
+        Args:
+            content: Original message content with notes
+            keep_chapters: Set of chapter numbers to keep
+            
+        Returns:
+            Filtered content with only relevant notes
+        """
+        # Split content into notes section and JSON section
+        notes_marker = "RELEVANT NOTES (SECTION + CHAPTER):"
+        json_marker = "JSON INPUT:"
+        
+        if notes_marker not in content:
+            return content
+        
+        # Extract parts
+        notes_start = content.find(notes_marker)
+        json_start = content.find(json_marker)
+        
+        if json_start == -1:
+            return content
+        
+        prefix = content[:notes_start]
+        notes_section = content[notes_start + len(notes_marker):json_start].strip()
+        json_section = content[json_start:]
+        
+        # Parse and filter notes
+        filtered_notes_parts = []
+        
+        # Split by note headers (=== SECTION X NOTES === or === CHAPTER XX NOTES ===)
+        note_blocks = re.split(r'(=== (?:SECTION \d+|CHAPTER \d+) NOTES ===)', notes_section)
+        
+        i = 0
+        while i < len(note_blocks):
+            block = note_blocks[i].strip()
+            if not block:
+                i += 1
+                continue
+                
+            # Check if this is a header
+            section_match = re.match(r'=== SECTION (\d+) NOTES ===', block)
+            chapter_match = re.match(r'=== CHAPTER (\d+) NOTES ===', block)
+            
+            if section_match:
+                section_num = int(section_match.group(1))
+                # Keep section notes if ANY of its chapters are in keep_chapters
+                # Use imported get_chapters_for_section from notes_loader
+                section_chapters = set(get_chapters_for_section(section_num))
+                if section_chapters & keep_chapters:
+                    # Include header and content
+                    header = block
+                    content_block = note_blocks[i + 1] if i + 1 < len(note_blocks) else ""
+                    filtered_notes_parts.append(f"{header}\n{content_block.strip()}")
+                i += 2  # Skip header and content
+            elif chapter_match:
+                chapter_num = int(chapter_match.group(1))
+                if chapter_num in keep_chapters:
+                    # Include header and content
+                    header = block
+                    content_block = note_blocks[i + 1] if i + 1 < len(note_blocks) else ""
+                    filtered_notes_parts.append(f"{header}\n{content_block.strip()}")
+                i += 2  # Skip header and content
+            else:
+                i += 1
+        
+        # Rebuild content
+        if filtered_notes_parts:
+            filtered_notes = "\n\n".join(filtered_notes_parts)
+            return f"{prefix}{notes_marker}\n{filtered_notes}\n\n{json_section}"
+        else:
+            # No notes to keep, just return prefix + JSON
+            return f"{prefix}{json_section}"
 
     def _select_chapters_stage1(self, product_description: str, k: int, diagnosis: Optional[str] = None, state: Dict = None) -> List[Tuple[str, float, str]]:
         """
@@ -505,8 +615,8 @@ class ClassificationEngine:
                     return final_results
                     
                 elif len(results) > 0:
-                    # We got some results but not enough
-                    logging.warning(f"Expected {k} chapters, got {len(results)}. Using what we have.")
+                    # We got some results but fewer than requested - this is acceptable
+                    logging.debug(f"Requested {k} chapters, got {len(results)}. Using what we have.")
                     return results
                 else:
                     # No valid results
@@ -690,7 +800,7 @@ class ClassificationEngine:
                     results.sort(key=lambda x: x[1], reverse=True)
                     return results[:k]
                 elif results:
-                    logging.warning(f"Stage 2: Expected {k} chapters, got {len(results)}")
+                    logging.debug(f"Stage 2: Requested {k} chapters, got {len(results)}")
                     results.sort(key=lambda x: x[1], reverse=True)
                     return results
                     
@@ -736,17 +846,21 @@ class ClassificationEngine:
             # Initialize trajectory if trajectory mode is enabled
             # The trajectory will contain:
             # 1. The system prompt
-            # 2. Chapter selection LLM calls (shared across all paths)
+            # 2. Chapter selection LLM calls (cleaned to only have THIS path's chapter notes)
             # 3. Actual per-path LLM request/response pairs
             if TRAJECTORY_MODE:
                 path.initialize_trajectory(UNIFIED_SYSTEM_PROMPT)
                 
                 # Prepend chapter selection calls to trajectory (these happened before paths were created)
                 if state is not None and "_chapter_selection_trajectory" in state:
-                    chapter_selection_turns = state["_chapter_selection_trajectory"]
-                    # Insert chapter selection turns after the system prompt
-                    path.trajectory = path.trajectory[:1] + chapter_selection_turns + path.trajectory[1:]
-                    logging.info(f"Initialized trajectory for path {i} with system prompt + {len(chapter_selection_turns)} chapter selection messages")
+                    # Clean trajectory to only keep notes for THIS path's chapter
+                    chapter_selection_turns = state["_chapter_selection_trajectory"].copy()
+                    this_chapter_set = {int(chapter)}
+                    cleaned_turns = self._clean_trajectory_notes_for_chapter(chapter_selection_turns, this_chapter_set)
+                    
+                    # Insert cleaned chapter selection turns after the system prompt
+                    path.trajectory = path.trajectory[:1] + cleaned_turns + path.trajectory[1:]
+                    logging.info(f"Initialized trajectory for path {i} with system prompt + {len(cleaned_turns)} chapter selection messages (notes cleaned for chapter {chapter})")
                 else:
                     logging.info(f"Initialized trajectory for path {i} with system prompt")
             
