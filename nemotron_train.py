@@ -61,6 +61,7 @@ import requests
 import gc
 import re
 import threading
+from collections import deque
 import shutil
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
@@ -115,7 +116,7 @@ class TreeRLConfig:
     # Context lengths
     # ----------------------------
     # NVIDIA examples often use 262144 default (256k).
-    vllm_max_model_len: int = 262144
+    vllm_max_model_len: int = 131072
 
     # Training max per sample (be realistic; long sequences + MoE can OOM)
     train_max_seq_length: int = 90000
@@ -185,16 +186,21 @@ class TreeRLConfig:
     )
 
     # Training settings
-    learning_rate: float = 5e-5
+    learning_rate: float = 5e-6
     weight_decay: float = 0.01
     warmup_steps: int = 10
-    gradient_accumulation_steps: int = 8  # Effective batch = micro_batch * grad_accum = 32
+    gradient_accumulation_steps: int = 4  # Effective batch = micro_batch * grad_accum = 32
     max_grad_norm: float = 1.0
     train_micro_batch_size: int = 1  # Samples per forward pass (1 = no batching, safest for long sequences)
+    train_dtype: str = "bfloat16"  # "bfloat16" | "float16"
 
     # Advantage shaping / normalization
     advantage_method: str = "grpo"  # none | grpo | grpo_no_std | gdpo
     gdpo_reward_weights: Tuple[float, ...] = (1.0, 1.0)
+    
+    # KL divergence penalty (stability knob)
+    # Penalize divergence from the base model policy to reduce drift/collapse.
+    kl_beta: float = 0.02
 
     # ----------------------------
     # Reward / advantage scaling (stability knobs)
@@ -228,7 +234,7 @@ class TreeRLConfig:
 
     # Data settings
     chapter: str = "84"
-    rulings_per_batch: int = 16  # Higher = more concurrent classifications = better vLLM utilization
+    rulings_per_batch: int = 8  # Higher = more concurrent classifications = better vLLM utilization
     accuracy_window_size: int = 10
     num_batches: int = 20
     num_epochs: int = 3
@@ -855,7 +861,7 @@ class VLLMInferenceClient:
     def _strip_think_tags(self, text: str) -> str:
         """
         Strip all <think>...</think> blocks and orphaned </think> tags from text.
-        Handles nested/multiple think blocks that the nano_v3 parser may miss.
+        Handles nested/multiple think blocks and UNCLOSED think blocks.
         """
         if not text:
             return text
@@ -867,6 +873,10 @@ class VLLMInferenceClient:
             prev_text = text
             text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
         
+        # CRITICAL: Remove unclosed <think> blocks (happens if model hits max tokens)
+        if '<think>' in text.lower():
+            text = re.sub(r'<think>[\s\S]*$', '', text, flags=re.IGNORECASE)
+            
         # Remove any orphaned </think> tags
         text = re.sub(r'</think>', '', text, flags=re.IGNORECASE)
         
@@ -874,6 +884,16 @@ class VLLMInferenceClient:
         text = re.sub(r'<think>', '', text, flags=re.IGNORECASE)
         
         return text.strip()
+
+    def _hit_thinking_limit_marker(self, text: str) -> bool:
+        """
+        Detect the logit-processor truncation marker in output text.
+        This indicates thinking was cut off and no content was produced.
+        """
+        if not text:
+            return False
+        lowered = text.lower()
+        return "thinking limit set by client" in lowered or "reached thinking limit" in lowered
 
     def _call_with_reasoning_budget(
         self,
@@ -1133,6 +1153,8 @@ class VLLMInferenceClient:
                 "thinking_budget": self.config.vllm_reasoning_budget,
                 "thinking_budget_grace_period": self.config.vllm_thinking_budget_grace_period,
                 "end_token_ids": json.dumps(list(self.config.vllm_thinking_end_token_ids)),
+                "end_think_ids": json.dumps([list(self.config.vllm_thinking_end_think_ids)]),
+                "prompt_think_ids": json.dumps(list(self.config.vllm_thinking_prompt_think_ids)),
             }
 
         try:
@@ -1254,9 +1276,12 @@ class VLLMInferenceClient:
                 if not text.strip():
                     raise ValueError("Empty response from vLLM API")
                 if requires_json:
-                    cleaned = self._extract_json_from_response(text)
-                    json.loads(cleaned)
-                    return cleaned
+                    try:
+                        cleaned = self._extract_json_from_response(text)
+                        json.loads(cleaned)
+                        return cleaned
+                    except Exception as json_error:
+                        raise json_error
                 return text
             except (ValueError, json.JSONDecodeError) as e:
                 last_error = e
@@ -1306,9 +1331,12 @@ class VLLMInferenceClient:
                 if not text.strip():
                     raise ValueError("Empty response from vLLM API")
                 if requires_json:
-                    cleaned = self._extract_json_from_response(text)
-                    json.loads(cleaned)
-                    return cleaned
+                    try:
+                        cleaned = self._extract_json_from_response(text)
+                        json.loads(cleaned)
+                        return cleaned
+                    except Exception as json_error:
+                        raise json_error
                 return text
             except (ValueError, json.JSONDecodeError) as e:
                 last_error = e
@@ -2157,6 +2185,8 @@ def load_training_model(
     # Note: 4-bit quantization not supported - Nemotron's custom _init_weights
     # has in-place ops incompatible with BitsAndBytes quantized tensors
     t0 = time.time()
+
+    torch_train_dtype = torch.bfloat16
     
     # For DDP (launched via torchrun), load to specific device
     if use_ddp:
@@ -2930,12 +2960,57 @@ def train_on_samples(
 
     adv_by_path_id = _compute_leaf_advantages(samples, config, logger)
 
+    # Advantage diagnostics (log for debugging)
+    adv_values = [float(adv_by_path_id.get(s.get("path_id", f"idx_{i}"), 0.0)) for i, s in enumerate(samples)]
+    adv_by_ruling: Dict[str, List[float]] = {}
+    for i, s in enumerate(samples):
+        gold_code = s.get("gold_code", "unknown")
+        adv = float(adv_by_path_id.get(s.get("path_id", f"idx_{i}"), 0.0))
+        adv_by_ruling.setdefault(gold_code, []).append(adv)
+    if adv_values:
+        adv_mean = sum(adv_values) / len(adv_values)
+        adv_mean_abs = sum(abs(v) for v in adv_values) / len(adv_values)
+        adv_min = min(adv_values)
+        adv_max = max(adv_values)
+        adv_var = sum((v - adv_mean) ** 2 for v in adv_values) / len(adv_values)
+        adv_std = math.sqrt(max(adv_var, 0.0))
+    else:
+        adv_mean = adv_mean_abs = adv_min = adv_max = adv_std = 0.0
+
+    # Per-ruling advantage stats
+    ruling_stats: List[Dict[str, float]] = []
+    for gold_code, vals in adv_by_ruling.items():
+        if not vals:
+            continue
+        r_mean = sum(vals) / len(vals)
+        r_min = min(vals)
+        r_max = max(vals)
+        r_var = sum((v - r_mean) ** 2 for v in vals) / len(vals)
+        r_std = math.sqrt(max(r_var, 0.0))
+        ruling_stats.append({
+            "gold_code": gold_code,
+            "count": len(vals),
+            "adv_mean": r_mean,
+            "adv_min": r_min,
+            "adv_max": r_max,
+            "adv_std": r_std,
+        })
+
     metrics = {
         "total_loss": 0.0,
         "num_samples": 0,  # trained samples (may be < len(samples) if we skip zero-weight samples)
         "skipped_truncated": 0,
         "skipped_error": 0,
         "skipped_zero_weight": 0,
+        "total_kl": 0.0,
+        "num_kl": 0,
+        "adv_mean": adv_mean,
+        "adv_mean_abs": adv_mean_abs,
+        "adv_min": adv_min,
+        "adv_max": adv_max,
+        "adv_std": adv_std,
+        "adv_ruling_stats": ruling_stats,
+        "adv_hist": adv_values,
     }
 
     accumulated_loss = 0.0
@@ -3182,7 +3257,7 @@ def train_on_samples(
                 ignore_index=ignore_index,
             )
             token_log_probs = -nll
-            
+
             # Apply weights and compute mean loss (move weights to compute device)
             batch_weights_device = batch_weights.to(device=compute_device, dtype=token_log_probs.dtype)
             weighted_log_probs = token_log_probs * batch_weights_device
@@ -3199,6 +3274,39 @@ def train_on_samples(
                 del batch_input_ids, batch_attention_mask, batch_weights, outputs, logits
                 continue
             loss = -weighted_log_probs.sum() / weight_mass
+
+            # KL penalty vs base model (LoRA disabled)
+            kl_beta = float(getattr(config, "kl_beta", 0.0) or 0.0)
+            if kl_beta > 0:
+                peft_model = model.module if hasattr(model, "module") else model
+                if hasattr(peft_model, "disable_adapter"):
+                    with torch.no_grad():
+                        with peft_model.disable_adapter():
+                            ref_outputs = model(
+                                input_ids=batch_input_ids,
+                                attention_mask=batch_attention_mask,
+                                return_dict=True
+                            )
+                    ref_logits = ref_outputs.logits
+                    ref_shift_logits = ref_logits[:, :-1, :]
+                    ref_nll = F.cross_entropy(
+                        ref_shift_logits.transpose(1, 2),
+                        labels,
+                        reduction="none",
+                        ignore_index=ignore_index,
+                    )
+                    ref_log_probs = -ref_nll
+                    kl_mask = (batch_weights_device.abs() > 0)
+                    if shift_mask is not None:
+                        kl_mask = kl_mask & (shift_mask > 0)
+                    kl_mass = kl_mask.sum()
+                    if kl_mass > 0:
+                        kl_token = token_log_probs - ref_log_probs
+                        kl_token = torch.clamp(kl_token, min=0.0)
+                        kl_mean = (kl_token * kl_mask).sum() / kl_mass
+                        loss = loss + (kl_beta * kl_mean)
+                        metrics["total_kl"] += float(kl_mean.item()) * len(kept_samples)
+                        metrics["num_kl"] += len(kept_samples)
             
             scaled_loss = loss / config.gradient_accumulation_steps
             scaled_loss.backward()
@@ -3292,6 +3400,7 @@ def train_on_samples(
         dist.barrier()
 
     metrics["avg_loss"] = metrics["total_loss"] / metrics["num_samples"] if metrics["num_samples"] else 0.0
+    metrics["avg_kl"] = metrics["total_kl"] / metrics["num_kl"] if metrics["num_kl"] else 0.0
     logger.info(
         f"  Training complete: trained {metrics['num_samples']}/{len(samples)} samples "
         f"(skipped_zero_weight={metrics['skipped_zero_weight']}, "
@@ -3685,7 +3794,7 @@ def train(config: TreeRLConfig):
     elif benchmark_rulings and config.skip_initial_benchmark:
         logger.info(f"\n⏭️  Skipping initial baseline benchmark (--skip-initial-benchmark)")
 
-    accuracy_rolling_samples = []
+    accuracy_rolling_rulings = deque()
 
     for epoch in range(config.num_epochs):
         epoch_start = time.time()
@@ -3854,20 +3963,57 @@ def train(config: TreeRLConfig):
             # =========================================================
             # ACCURACY METRICS (Rolling)
             # =========================================================
+            # Build per-ruling samples for this batch (preserve batch_rulings order)
+            per_ruling_samples: Dict[str, List[Dict]] = {}
             for s in all_batch_samples:
-                accuracy_rolling_samples.append(s)
+                g = s.get("gold_code", "unknown")
+                per_ruling_samples.setdefault(g, []).append(s)
 
-            # Keep last N unique rulings
-            unique_gold_codes = []
-            for s in accuracy_rolling_samples:
-                g = s.get("gold_code")
-                if g and g not in unique_gold_codes:
-                    unique_gold_codes.append(g)
-            if len(unique_gold_codes) > config.accuracy_window_size:
-                keep = set(unique_gold_codes[-config.accuracy_window_size:])
-                accuracy_rolling_samples = [s for s in accuracy_rolling_samples if s.get("gold_code") in keep]
+            for ruling in batch_rulings:
+                gold_code = ruling.get("hts_code", "unknown")
+                accuracy_rolling_rulings.append({
+                    "gold_code": gold_code,
+                    "samples": per_ruling_samples.get(gold_code, []),
+                })
+            while len(accuracy_rolling_rulings) > config.accuracy_window_size:
+                accuracy_rolling_rulings.popleft()
 
-            accuracy_metrics = compute_batch_accuracy(accuracy_rolling_samples, logger)
+            # Compute rolling metrics across last N rulings (counts even if no samples)
+            if accuracy_rolling_rulings:
+                best_rewards = []
+                total_rewards = 0.0
+                total_samples = 0
+                for entry in accuracy_rolling_rulings:
+                    samples = entry["samples"]
+                    if samples:
+                        rewards = [float(s.get("leaf_reward", s.get("reward", 0.0)) or 0.0) for s in samples]
+                        best_reward = max(rewards) if rewards else 0.0
+                        total_rewards += sum(rewards)
+                        total_samples += len(rewards)
+                    else:
+                        best_reward = 0.0
+                    best_rewards.append(best_reward)
+
+                num_rulings = len(accuracy_rolling_rulings)
+                num_exact_matches = sum(1 for r in best_rewards if r >= 0.9999)
+                avg_best_reward = sum(best_rewards) / num_rulings if num_rulings else 0.0
+                avg_reward = (total_rewards / total_samples) if total_samples else 0.0
+                exact_match_rate = num_exact_matches / num_rulings if num_rulings else 0.0
+            else:
+                num_rulings = 0
+                num_exact_matches = 0
+                avg_best_reward = 0.0
+                avg_reward = 0.0
+                exact_match_rate = 0.0
+
+            accuracy_metrics = {
+                "exact_match_rate": exact_match_rate,
+                "avg_best_reward": avg_best_reward,
+                "avg_reward": avg_reward,
+                "num_rulings": num_rulings,
+                "num_exact_matches": num_exact_matches,
+            }
+
             logger.info(f"\n📊 ROLLING ACCURACY (window={config.accuracy_window_size} rulings):")
             logger.info(f"  Exact match rate: {accuracy_metrics['exact_match_rate']:.1%} ({accuracy_metrics['num_exact_matches']}/{accuracy_metrics['num_rulings']})")
             logger.info(f"  Avg best reward: {accuracy_metrics['avg_best_reward']:.4f}")
@@ -3940,6 +4086,11 @@ def train(config: TreeRLConfig):
                 "adapter_path": new_adapter_path,
                 "skipped_truncated": int(train_metrics.get("skipped_truncated", 0)),
                 "skipped_error": int(train_metrics.get("skipped_error", 0)),
+                "adv_mean": float(train_metrics.get("adv_mean", 0.0)),
+                "adv_mean_abs": float(train_metrics.get("adv_mean_abs", 0.0)),
+                "adv_min": float(train_metrics.get("adv_min", 0.0)),
+                "adv_max": float(train_metrics.get("adv_max", 0.0)),
+                "adv_std": float(train_metrics.get("adv_std", 0.0)),
             }
             all_metrics.append(batch_metrics)
 
@@ -3949,7 +4100,40 @@ def train(config: TreeRLConfig):
                 "avg_best_reward": float(accuracy_metrics["avg_best_reward"]),
                 "avg_reward": float(accuracy_metrics["avg_reward"]),
                 "num_samples": int(train_metrics.get("num_samples", 0)),
+                "adv_mean": float(train_metrics.get("adv_mean", 0.0)),
+                "adv_mean_abs": float(train_metrics.get("adv_mean_abs", 0.0)),
+                "adv_min": float(train_metrics.get("adv_min", 0.0)),
+                "adv_max": float(train_metrics.get("adv_max", 0.0)),
+                "adv_std": float(train_metrics.get("adv_std", 0.0)),
             }, step=global_batch_num, prefix="batch")
+
+            # Per-ruling advantage table + histogram (full debug)
+            if wandb_run is not None:
+                try:
+                    import wandb
+                    adv_hist = train_metrics.get("adv_hist", [])
+                    if adv_hist:
+                        log_to_wandb(wandb_run, {
+                            "adv_hist": wandb.Histogram(adv_hist),
+                        }, step=global_batch_num, prefix="batch")
+
+                    adv_ruling_stats = train_metrics.get("adv_ruling_stats", [])
+                    if adv_ruling_stats:
+                        table = wandb.Table(columns=["gold_code", "count", "adv_mean", "adv_min", "adv_max", "adv_std"])
+                        for row in adv_ruling_stats:
+                            table.add_data(
+                                row.get("gold_code"),
+                                row.get("count"),
+                                row.get("adv_mean"),
+                                row.get("adv_min"),
+                                row.get("adv_max"),
+                                row.get("adv_std"),
+                            )
+                        log_to_wandb(wandb_run, {
+                            "adv_per_ruling": table,
+                        }, step=global_batch_num, prefix="batch")
+                except Exception:
+                    pass
 
             # =========================================================
             # BENCHMARK EVALUATION (every N batches)
@@ -4016,6 +4200,7 @@ def train(config: TreeRLConfig):
             logger.info(f"  Samples: {len(all_batch_samples)}")
             logger.info(f"  Trained: {train_metrics.get('num_samples', 0)}")
             logger.info(f"  Loss: {avg_loss:.4f}")
+            logger.info(f"  Avg KL: {train_metrics.get('avg_kl', 0.0):.4f}")
             logger.info(f"  Exact match: {accuracy_metrics['exact_match_rate']:.1%}")
             logger.info(f"  Time: {batch_time:.1f}s ({batch_time/60:.1f}m)")
             logger.info(f"{'─' * 50}")
@@ -4132,12 +4317,12 @@ def main():
                         help="DDP backend (nccl for GPU, gloo for CPU)")
 
     # Training args
-    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
-    parser.add_argument("--grad-accum", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
+    parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--micro-batch-size", type=int, default=1, help="Samples per forward pass (batched training)")
 
     # Batch/Epoch structure
-    parser.add_argument("--rulings-per-batch", type=int, default=16, help="Rulings per batch (higher = better vLLM utilization)")
+    parser.add_argument("--rulings-per-batch", type=int, default=8, help="Rulings per batch (higher = better vLLM utilization)")
     parser.add_argument("--accuracy-window", type=int, default=10, help="Accuracy rolling window (unique rulings)")
     parser.add_argument("--num-batches", type=int, default=20, help="Batches per epoch")
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
@@ -4163,6 +4348,8 @@ def main():
                         help="When advantage_method!=none, multiply leaf advantages by this factor")
     parser.add_argument("--token-weight-clip", type=float, default=0.0,
                         help="Clip final per-token weights to [-clip, clip] (0 disables)")
+    parser.add_argument("--kl-beta", type=float, default=0.02,
+                        help="KL penalty coefficient vs base model (LoRA disabled)")
 
     # Data args
     parser.add_argument("--chapter", type=str, default="84", help="HTS chapter to train on")
@@ -4227,6 +4414,7 @@ def main():
         step_reward_scale=args.step_reward_scale,
         leaf_advantage_scale=args.leaf_advantage_scale,
         token_weight_clip=args.token_weight_clip,
+        kl_beta=args.kl_beta,
         chapter=args.chapter,
         cross_rulings_file=args.cross_rulings_file,
         train_all=args.train_all,
