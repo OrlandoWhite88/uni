@@ -1450,13 +1450,28 @@ class ClassificationEngine:
                 logging.warning("Malformed question generated (empty text or options). Retrying once...")
                 try:
                     time.sleep(1)
-                    content_retry = self.llm.send_openai_request(
-                        prompt=full_prompt,
-                        temperature=LLM_TEMPERATURE,
-                        requires_json=True,
-                        task_type="generate_question",
-                        prompt_json=prompt_json
-                    )
+                    # Retry using the same mode as the original request
+                    if TRAJECTORY_MODE and path and path._trajectory_initialized:
+                        # Re-use trajectory mode for retry
+                        messages = path.get_trajectory_for_request(user_message_content)
+                        content_retry = self.llm.send_trajectory_request(
+                            messages=messages,
+                            temperature=LLM_TEMPERATURE,
+                            requires_json=True,
+                            task_type="generate_question",
+                            prompt_json=prompt_json
+                        )
+                    else:
+                        # Stateless mode retry
+                        system_instruction = build_question_generation_prompt("")
+                        full_prompt = f"{system_instruction}\n\n{user_message_content}"
+                        content_retry = self.llm.send_openai_request(
+                            prompt=full_prompt,
+                            temperature=LLM_TEMPERATURE,
+                            requires_json=True,
+                            task_type="generate_question",
+                            prompt_json=prompt_json
+                        )
                     question_data = json.loads(content_retry)
                     
                     # Handle models that wrap the object in a list
@@ -1611,13 +1626,28 @@ class ClassificationEngine:
                 logging.warning(f"Answer processing validation failed (selected_option={selected_option}, updated_desc_present={bool(updated_description)}). Retrying once...")
                 try:
                     time.sleep(1)
-                    content_retry = self.llm.send_openai_request(
-                        prompt=full_prompt,
-                        temperature=LLM_TEMPERATURE,
-                        requires_json=True,
-                        task_type="process_answer",
-                        prompt_json=prompt_json
-                    )
+                    # Retry using the same mode as the original request
+                    if TRAJECTORY_MODE and path and path._trajectory_initialized:
+                        # Re-use trajectory mode for retry
+                        messages = path.get_trajectory_for_request(user_message_content)
+                        content_retry = self.llm.send_trajectory_request(
+                            messages=messages,
+                            temperature=LLM_TEMPERATURE,
+                            requires_json=True,
+                            task_type="process_answer",
+                            prompt_json=prompt_json
+                        )
+                    else:
+                        # Stateless mode retry
+                        system_instruction = build_answer_processing_prompt("")
+                        full_prompt = f"{system_instruction}\n\n{user_message_content}"
+                        content_retry = self.llm.send_openai_request(
+                            prompt=full_prompt,
+                            temperature=LLM_TEMPERATURE,
+                            requires_json=True,
+                            task_type="process_answer",
+                            prompt_json=prompt_json
+                        )
                     result = _unwrap_json_response(json.loads(content_retry))
                     extracted_attributes = result.get("extracted_attributes", {})
                     if "product_attributes" not in state:

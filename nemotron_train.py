@@ -12,6 +12,14 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 # Explicitly set vLLM device type (helps in some containers)
 os.environ.setdefault("VLLM_TARGET_DEVICE", "cuda")
 
+# Reduce CUDA memory fragmentation for long sequences / KL
+# Note: PYTORCH_CUDA_ALLOC_CONF is deprecated, use PYTORCH_ALLOC_CONF
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+# Disable vLLM custom all-reduce kernel - use NCCL instead
+# Required for Blackwell (B200) GPUs where custom_all_reduce.cuh fails
+os.environ.setdefault("VLLM_DISABLED_CUSTOM_ALL_REDUCE", "1")
+
 # =============================================================================
 # NOW SAFE TO IMPORT
 # =============================================================================
@@ -170,6 +178,11 @@ class TreeRLConfig:
     vllm_thinking_end_token_ids: Tuple[int, ...] = (1871, 5565, 11483, 6139, 2016, 1536, 6934, 1338, 13)
     vllm_thinking_end_think_ids: Tuple[int, ...] = (13,)
     vllm_thinking_prompt_think_ids: Tuple[int, ...] = (12, 1010)
+
+    # JSON safety controls (prevents runaway/invalid outputs)
+    # Note: Model generates long reasoning in JSON - need high limit to avoid truncation
+    json_output_max_tokens: int = 8192
+    json_disable_thinking: bool = True
     
     # Tool calling flags (disabled by default - enable if needed)
     vllm_enable_auto_tool_choice: bool = False
@@ -180,13 +193,18 @@ class TreeRLConfig:
     # ----------------------------
     lora_rank: int = 64
     lora_alpha: int = 128
+    # Nemotron-3-Nano target modules (no gate_proj - uses relu2 MLP, not SwiGLU)
+    # - Attention: q_proj, k_proj, v_proj, o_proj
+    # - Mamba2: in_proj, out_proj  
+    # - MLP/MoE: up_proj, down_proj
     lora_target_modules: Tuple[str, ...] = (
         "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj",
+        "up_proj", "down_proj",
+        "in_proj", "out_proj",
     )
 
     # Training settings
-    learning_rate: float = 5e-6
+    learning_rate: float = 1e-5  # Increased from 5e-6 for faster learning (requires working KL penalty)
     weight_decay: float = 0.01
     warmup_steps: int = 10
     gradient_accumulation_steps: int = 4  # Effective batch = micro_batch * grad_accum = 32
@@ -200,14 +218,29 @@ class TreeRLConfig:
     
     # KL divergence penalty (stability knob)
     # Penalize divergence from the base model policy to reduce drift/collapse.
-    kl_beta: float = 0.02
+    # With sample_abs, 0.1 provides strong regularization against policy collapse.
+    kl_beta: float = 0.1
+    
+    # KL computation method:
+    # - "full": True KL over full vocabulary (expensive, accurate, requires [B,L,V] tensors)
+    # - "sample_squared": 0.5 * (log_ratio)^2 approximation (cheap, always ≥ 0)
+    # - "sample_abs": |log_ratio| (cheap, always ≥ 0, standard in PPO)
+    # 
+    # Note: sample_abs is NOT mathematically equivalent to full KL, but provides
+    # similar gradient signal for policy regularization with much lower VRAM.
+    # Full KL considers ALL vocab tokens; sample-based only considers the generated token.
+    kl_method: str = "sample_abs"  # Default to cheap method (full KL OOMs on long seqs)
+    # If sequences are long, fall back to cheaper KL to avoid OOM (only matters if kl_method="full")
+    kl_full_max_seq_len: int = 4096
+    kl_fallback_method: str = "sample_abs"
 
     # ----------------------------
     # Reward / advantage scaling (stability knobs)
     # ----------------------------
     # TreeRL step rewards R(s) are intentionally reweighted by 1/sqrt(|L(s)|),
     # which can make per-token weights very small. Scaling helps avoid tiny gradients.
-    step_reward_scale: float = 1.0
+    # Raw step rewards typically have mean ~0.002-0.004, so 10x scaling gives ~0.02-0.04
+    step_reward_scale: float = 10.0
 
     # When advantage_method != "none", we multiply token weights by a per-trajectory
     # leaf-level advantage (GRPO/GDPO). This multiplier optionally scales that term.
@@ -634,6 +667,29 @@ class VLLMServerManager:
         # vLLM LoRA support (PR #30802)
         if self.config.use_vllm_lora and lora_adapter_path:
             self._current_lora_path = lora_adapter_path
+            
+            # Verify adapter exists and has expected files
+            adapter_config = os.path.join(lora_adapter_path, "adapter_config.json")
+            adapter_weights = os.path.join(lora_adapter_path, "adapter_model.safetensors")
+            adapter_weights_bin = os.path.join(lora_adapter_path, "adapter_model.bin")
+            
+            if not os.path.exists(adapter_config):
+                self.logger.error(f"  ❌ LoRA adapter_config.json not found: {adapter_config}")
+                raise FileNotFoundError(f"LoRA adapter not found: {lora_adapter_path}")
+            
+            if not os.path.exists(adapter_weights) and not os.path.exists(adapter_weights_bin):
+                self.logger.error(f"  ❌ LoRA weights not found at: {lora_adapter_path}")
+                raise FileNotFoundError(f"LoRA weights not found: {lora_adapter_path}")
+            
+            # Log adapter file info for verification
+            weights_path = adapter_weights if os.path.exists(adapter_weights) else adapter_weights_bin
+            weights_size = os.path.getsize(weights_path) / (1024 * 1024)  # MB
+            weights_mtime = datetime.fromtimestamp(os.path.getmtime(weights_path)).isoformat()
+            self.logger.info(f"  LoRA adapter verified:")
+            self.logger.info(f"    Path: {lora_adapter_path}")
+            self.logger.info(f"    Weights: {os.path.basename(weights_path)} ({weights_size:.1f} MB)")
+            self.logger.info(f"    Modified: {weights_mtime}")
+            
             # --enable-lora enables LoRA adapter support
             # --lora-modules format: name=path (can specify multiple)
             lora_module_spec = f"{self.config.vllm_lora_name}={lora_adapter_path}"
@@ -642,7 +698,7 @@ class VLLMServerManager:
                 "--lora-modules", lora_module_spec,
                 "--max-lora-rank", "64",  # Support higher rank LoRA adapters
             ])
-            self.logger.info(f"  LoRA enabled: {lora_module_spec}")
+            self.logger.info(f"  LoRA module spec: {lora_module_spec}")
         else:
             self._current_lora_path = None
 
@@ -800,6 +856,17 @@ class VLLMServerManager:
 # VLLM INFERENCE CLIENT (Nemotron thinking with OpenAI API)
 # ============================================================================
 
+JSON_REQUIREMENTS = (
+    "CRITICAL JSON REQUIREMENTS:\n"
+    "- Return ONLY valid JSON with no additional text\n"
+    "- Do NOT include a 'thinking' field in the JSON - put reasoning in 'reasoning' field only\n"
+    "- Keep 'reasoning' fields brief (1-2 sentences max)\n"
+    "- Do not include any explanation before or after the JSON\n"
+    "- If generating an array, ensure it starts with [ and ends with ]\n"
+    "- All JSON objects must be properly separated by commas within the array\n"
+    "- Do not generate separate JSON objects - they must be inside an array"
+)
+
 class VLLMInferenceClient:
     """
     vLLM-based LLM client for Nemotron-3-Nano with reasoning budget support.
@@ -836,8 +903,11 @@ class VLLMInferenceClient:
         # This tells vLLM to use the LoRA adapter instead of base model
         if config.use_vllm_lora and server_manager._current_lora_path:
             self.model_name = config.vllm_lora_name
+            logger.info(f"  VLLMClient using LoRA model: {self.model_name}")
+            logger.info(f"    LoRA path: {server_manager._current_lora_path}")
         else:
             self.model_name = config.vllm_served_model_name
+            logger.info(f"  VLLMClient using base model: {self.model_name}")
 
         # JSON retry settings - increase retries for model format inconsistency
         self._max_json_retries = 6
@@ -857,6 +927,19 @@ class VLLMInferenceClient:
 
     def _current_system_prompt(self) -> str:
         return (self._system_prompt_injection or self.system_prompt).strip()
+
+    def _append_json_requirements_to_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Append strict JSON requirements to the last user turn."""
+        updated = [m.copy() for m in messages]
+        for idx in range(len(updated) - 1, -1, -1):
+            if updated[idx].get("role") == "user":
+                content = (updated[idx].get("content") or "").rstrip()
+                if "CRITICAL JSON REQUIREMENTS:" not in content:
+                    updated[idx]["content"] = f"{content}\n\n{JSON_REQUIREMENTS}"
+                return updated
+        # No user message found; append requirements as a user turn
+        updated.append({"role": "user", "content": JSON_REQUIREMENTS})
+        return updated
 
     def _strip_think_tags(self, text: str) -> str:
         """
@@ -1045,77 +1128,17 @@ class VLLMInferenceClient:
     def _extract_json_from_response(self, response_text: str) -> str:
         """
         Extract valid JSON from response text.
-        Expects clean content from reasoning parser (no <think> tags).
+        Uses shared _extract_json_candidate logic, raises on failure.
         """
         if not response_text:
             raise ValueError("Empty response - retry needed")
-
-        text = response_text.strip()
         
-        # Handle markdown code blocks
-        if "```json" in text:
-            match = re.search(r'```json\s*([\s\S]*?)\s*```', text)
-            if match:
-                text = match.group(1).strip()
-        elif "```" in text:
-            match = re.search(r'```\s*([\s\S]*?)\s*```', text)
-            if match:
-                text = match.group(1).strip()
-
-        # Try direct parse
-        try:
-            json.loads(text)
-            return text
-        except Exception:
-            pass
-
-        # Find first JSON object/array
-        first_bracket = -1
-        for i, c in enumerate(text):
-            if c in '[{':
-                first_bracket = i
-                break
+        parsed = _extract_json_candidate(response_text)
+        if parsed is None:
+            raise ValueError(f"No valid JSON found in response:\n{response_text[:500]}")
         
-        if first_bracket == -1:
-            raise ValueError(f"No JSON found in response:\n{text}")
-        
-        # Extract balanced JSON
-        start_pos = first_bracket
-        depth = 0
-        end_pos = -1
-        in_string = False
-        escape_next = False
-        
-        for i in range(start_pos, len(text)):
-            c = text[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if c == '\\':
-                escape_next = True
-                continue
-            if c == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c in "[{":
-                depth += 1
-            elif c in "]}":
-                depth -= 1
-                if depth == 0:
-                    end_pos = i
-                    break
-        
-        if end_pos > start_pos:
-            candidate = text[start_pos:end_pos + 1]
-            try:
-                json.loads(candidate)
-                return candidate
-            except Exception:
-                pass
-        
-        raise ValueError(f"Invalid JSON in response:\n{text}")
+        # Return as string (re-serialize to ensure clean formatting)
+        return json.dumps(parsed, ensure_ascii=False)
 
     def _call_vllm_api(
         self,
@@ -1257,21 +1280,44 @@ class VLLMInferenceClient:
             {"role": "system", "content": self._current_system_prompt()},
             {"role": "user", "content": user_content},
         ]
+        if requires_json:
+            messages = self._append_json_requirements_to_messages(messages)
 
         last_error = None
+        base_disable_thinking = bool(getattr(self.config, "json_disable_thinking", True)) if requires_json else False
         for attempt in range(self._max_json_retries if requires_json else 1):
             try:
-                if use_reasoning_budget and self.reasoning_budget > 0:
+                disable_thinking = base_disable_thinking or (requires_json and attempt > 0)
+                effective_temp = 0.0 if (requires_json and attempt > 0) else temperature
+                max_tokens_to_use = max_tokens
+                json_cap = int(getattr(self.config, "json_output_max_tokens", 0) or 0)
+                if requires_json and json_cap > 0:
+                    max_tokens_to_use = min(max_tokens or json_cap, json_cap) if max_tokens else json_cap
+
+                effective_use_budget = bool(use_reasoning_budget and self.reasoning_budget > 0 and not disable_thinking)
+                if effective_use_budget:
                     total_budget = self.reasoning_budget + self.completion_budget
+                    if max_tokens_to_use:
+                        total_budget = min(total_budget, max_tokens_to_use)
                     safe_max = self._calculate_max_tokens(messages, total_budget)
                     if safe_max < total_budget:
                         self.logger.warning(
                             f"  ⚠️ Output budget reduced by context: "
                             f"requested={total_budget}, safe_max={safe_max}"
                         )
-                    text = self._call_vllm_api(messages, temperature=temperature, max_tokens=safe_max)
+                    text = self._call_vllm_api(
+                        messages,
+                        temperature=effective_temp,
+                        max_tokens=safe_max,
+                        enable_thinking=not disable_thinking,
+                    )
                 else:
-                    text = self._call_vllm_api(messages, temperature=temperature, max_tokens=max_tokens)
+                    text = self._call_vllm_api(
+                        messages,
+                        temperature=effective_temp,
+                        max_tokens=max_tokens_to_use,
+                        enable_thinking=not disable_thinking,
+                    )
                 
                 if not text.strip():
                     raise ValueError("Empty response from vLLM API")
@@ -1312,21 +1358,44 @@ class VLLMInferenceClient:
             use_reasoning_budget: Enforce reasoning budget via logits processor
         """
         req_messages = [m.copy() for m in messages]
+        if requires_json:
+            req_messages = self._append_json_requirements_to_messages(req_messages)
 
         last_error = None
+        base_disable_thinking = bool(getattr(self.config, "json_disable_thinking", True)) if requires_json else False
         for attempt in range(self._max_json_retries if requires_json else 1):
             try:
-                if use_reasoning_budget and self.reasoning_budget > 0:
+                disable_thinking = base_disable_thinking or (requires_json and attempt > 0)
+                effective_temp = 0.0 if (requires_json and attempt > 0) else temperature
+                max_tokens_to_use = max_tokens
+                json_cap = int(getattr(self.config, "json_output_max_tokens", 0) or 0)
+                if requires_json and json_cap > 0:
+                    max_tokens_to_use = min(max_tokens or json_cap, json_cap) if max_tokens else json_cap
+
+                effective_use_budget = bool(use_reasoning_budget and self.reasoning_budget > 0 and not disable_thinking)
+                if effective_use_budget:
                     total_budget = self.reasoning_budget + self.completion_budget
+                    if max_tokens_to_use:
+                        total_budget = min(total_budget, max_tokens_to_use)
                     safe_max = self._calculate_max_tokens(req_messages, total_budget)
                     if safe_max < total_budget:
                         self.logger.warning(
                             f"  ⚠️ Output budget reduced by context: "
                             f"requested={total_budget}, safe_max={safe_max}"
                         )
-                    text = self._call_vllm_api(req_messages, temperature=temperature, max_tokens=safe_max)
+                    text = self._call_vllm_api(
+                        req_messages,
+                        temperature=effective_temp,
+                        max_tokens=safe_max,
+                        enable_thinking=not disable_thinking,
+                    )
                 else:
-                    text = self._call_vllm_api(req_messages, temperature=temperature, max_tokens=max_tokens)
+                    text = self._call_vllm_api(
+                        req_messages,
+                        temperature=effective_temp,
+                        max_tokens=max_tokens_to_use,
+                        enable_thinking=not disable_thinking,
+                    )
                 
                 if not text.strip():
                     raise ValueError("Empty response from vLLM API")
@@ -1575,7 +1644,17 @@ def save_mapping_debug(
                 match_result = None
                 
                 try:
-                    assistant_json = json.loads(content)
+                    assistant_json = _extract_json_candidate(content)
+                    if assistant_json is None:
+                        raise json.JSONDecodeError("Invalid JSON", content, 0)
+                    
+                    # Unwrap list if model wrapped response in array
+                    if isinstance(assistant_json, list):
+                        if len(assistant_json) == 1 and isinstance(assistant_json[0], dict):
+                            assistant_json = assistant_json[0]
+                        else:
+                            extraction_result = f"SKIP: response is list with {len(assistant_json)} items"
+                            raise json.JSONDecodeError("Response is list", content, 0)
                     
                     if "top_selection" in assistant_json:
                         chapter = str(assistant_json["top_selection"])
@@ -1976,16 +2055,8 @@ def run_online_rollout(
                 trace_path_parts.append(step.get("code", "??"))
         trace_path_str = " > ".join(trace_path_parts)
         
-        # Validate gold trace using same criterion as pre-filter
-        from api.treerl_gold_trace import normalize_code
-        is_valid, reason = is_gold_trace_valid(gold_code, gold_trace, normalize_code)
-        
-        if is_valid:
-            logger.info(f"  [rollout] Gold: {gold_code} | {len(gold_trace)} steps | {trace_path_str}")
-        else:
-            logger.warning(f"  [rollout] ⚠️ SKIPPING - Gold code '{gold_code}' invalid: {reason}")
-            logger.warning(f"  [rollout]    Trace: {trace_path_str}")
-            return []
+        # Log gold trace info (validation already done in pre-filter)
+        logger.info(f"  [rollout] Gold: {gold_code} | {len(gold_trace)} steps | {trace_path_str}")
 
         logger.debug(f"  [rollout] Initializing auto-responder...")
         auto_responder = LLMAutoResponder(engine_name="groq", debug=False)
@@ -2256,7 +2327,26 @@ def load_training_model(
     if adapter_path and os.path.isdir(adapter_path):
         adapter_config_path = os.path.join(adapter_path, "adapter_config.json")
         if os.path.exists(adapter_config_path):
-            logger.info(f"  Loading adapter: {adapter_path}")
+            logger.info(f"  Loading adapter weights from: {adapter_path}")
+            # Check if adapter config matches current config
+            try:
+                import json
+                with open(adapter_config_path, "r") as f:
+                    saved_adapter_config = json.load(f)
+                saved_target_modules = set(saved_adapter_config.get("target_modules", []))
+                current_target_modules = set(config.lora_target_modules)
+                if saved_target_modules != current_target_modules:
+                    logger.warning(f"    ⚠️ Target module mismatch!")
+                    logger.warning(f"      Saved adapter targets: {sorted(saved_target_modules)}")
+                    logger.warning(f"      Current config targets: {sorted(current_target_modules)}")
+                    # Only modules in BOTH will be loaded
+                    common = saved_target_modules & current_target_modules
+                    logger.warning(f"      Common (will load): {sorted(common)}")
+                saved_rank = saved_adapter_config.get("r", None)
+                if saved_rank and saved_rank != config.lora_rank:
+                    logger.warning(f"    ⚠️ LoRA rank mismatch! Saved: {saved_rank}, Current: {config.lora_rank}")
+            except Exception as e:
+                logger.warning(f"    Could not parse adapter config: {e}")
             try:
                 from peft import set_peft_model_state_dict
                 from safetensors.torch import load_file
@@ -2264,13 +2354,51 @@ def load_training_model(
                 adapter_weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
                 if os.path.exists(adapter_weights_path):
                     adapter_weights = load_file(adapter_weights_path)
+                    logger.info(f"    Loaded safetensors: {len(adapter_weights)} tensors")
                 else:
                     adapter_weights_path = os.path.join(adapter_path, "adapter_model.bin")
-                    adapter_weights = torch.load(adapter_weights_path, map_location="cpu", weights_only=True)
+                    if os.path.exists(adapter_weights_path):
+                        adapter_weights = torch.load(adapter_weights_path, map_location="cpu", weights_only=True)
+                        logger.info(f"    Loaded bin: {len(adapter_weights)} tensors")
+                    else:
+                        logger.warning(f"  ⚠️ No adapter weights found at {adapter_path}")
+                        adapter_weights = None
                 
-                set_peft_model_state_dict(model, adapter_weights)
+                if adapter_weights:
+                    # Verify adapter weights look reasonable (check a sample weight)
+                    sample_key = next(iter(adapter_weights.keys()), None)
+                    if sample_key:
+                        sample_tensor = adapter_weights[sample_key]
+                        logger.info(f"    Sample weight '{sample_key[:50]}...': shape={list(sample_tensor.shape)}, "
+                                   f"mean={sample_tensor.float().mean().item():.6f}, std={sample_tensor.float().std().item():.6f}")
+                    
+                    # Load the weights
+                    incompatible = set_peft_model_state_dict(model, adapter_weights)
+                    if incompatible and (incompatible.missing_keys or incompatible.unexpected_keys):
+                        n_missing = len(incompatible.missing_keys)
+                        n_unexpected = len(incompatible.unexpected_keys)
+                        logger.warning(f"    ⚠️ Incompatible keys: missing={n_missing}, unexpected={n_unexpected}")
+                        # Log sample of missing keys to help debug
+                        if incompatible.missing_keys:
+                            sample_missing = list(incompatible.missing_keys)[:5]
+                            logger.warning(f"    Sample missing keys: {sample_missing}")
+                        if incompatible.unexpected_keys:
+                            sample_unexpected = list(incompatible.unexpected_keys)[:5]
+                            logger.warning(f"    Sample unexpected keys: {sample_unexpected}")
+                        # If ALL keys are missing, this is a critical error - the adapter is from a different model
+                        loaded_count = len(adapter_weights) - n_unexpected
+                        if loaded_count == 0:
+                            logger.error(f"    ❌ No adapter weights were loaded! Adapter may be incompatible with model.")
+                        else:
+                            logger.info(f"    ✓ Loaded {loaded_count}/{len(adapter_weights)} adapter weights (partial load)")
+                    else:
+                        logger.info(f"    ✓ Adapter weights loaded successfully")
             except Exception as e:
-                logger.warning(f"  Could not load adapter: {e}")
+                logger.error(f"  ❌ Failed to load adapter: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+        else:
+            logger.warning(f"  ⚠️ adapter_config.json not found at {adapter_path}")
 
     # Enable training mode and gradient checkpointing
     model.train()
@@ -2486,6 +2614,71 @@ def format_hts_code(code: str) -> str:
     return f"{digits[0:4]}.{digits[4:6]}.{digits[6:8]}.{digits[8:10]}"
 
 
+def _extract_json_candidate(text: str) -> Optional[Any]:
+    """Best-effort JSON extraction from a raw model response."""
+    if not text:
+        return None
+    candidate_text = text.strip()
+
+    # Handle markdown code blocks
+    if "```json" in candidate_text:
+        match = re.search(r'```json\s*([\s\S]*?)\s*```', candidate_text)
+        if match:
+            candidate_text = match.group(1).strip()
+    elif "```" in candidate_text:
+        match = re.search(r'```\s*([\s\S]*?)\s*```', candidate_text)
+        if match:
+            candidate_text = match.group(1).strip()
+
+    # Try direct parse
+    try:
+        return json.loads(candidate_text)
+    except Exception:
+        pass
+
+    # Find first JSON object/array and extract balanced chunk
+    first_bracket = -1
+    for i, c in enumerate(candidate_text):
+        if c in "[{":
+            first_bracket = i
+            break
+    if first_bracket == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape_next = False
+    end_pos = -1
+    for i in range(first_bracket, len(candidate_text)):
+        c = candidate_text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if c == "\\":
+            escape_next = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c in "[{":
+            depth += 1
+        elif c in "]}":
+            depth -= 1
+            if depth == 0:
+                end_pos = i
+                break
+
+    if end_pos > first_bracket:
+        snippet = candidate_text[first_bracket:end_pos + 1]
+        try:
+            return json.loads(snippet)
+        except Exception:
+            return None
+    return None
+
+
 def _extract_selected_identifier_from_turn(
     user_msg: str,
     assistant_msg: str
@@ -2500,9 +2693,8 @@ def _extract_selected_identifier_from_turn(
         - 'node_id': node ID (for groups)
         Or None if parsing fails.
     """
-    try:
-        assistant_json = json.loads(assistant_msg)
-    except (json.JSONDecodeError, TypeError):
+    assistant_json = _extract_json_candidate(assistant_msg)
+    if assistant_json is None:
         return None
 
     # Some providers/models return a list instead of the named-dict format:
@@ -2949,6 +3141,22 @@ def train_on_samples(
     logger.info(f"Training on {len(samples)} samples...")
     logger.info(f"  Train max seq length: {config.train_max_seq_length}")
     logger.info(f"  Gradient accumulation: {config.gradient_accumulation_steps}")
+    logger.info(f"  Learning rate: {config.learning_rate}")
+    logger.info(f"  KL beta: {config.kl_beta} (method: {config.kl_method})")
+    
+    # Warn if high LR without KL penalty
+    if config.learning_rate >= 1e-5 and config.kl_beta < 0.01:
+        logger.warning(f"  ⚠️ High LR ({config.learning_rate}) with low KL beta ({config.kl_beta}) may cause drift!")
+        logger.warning(f"     Consider --kl-beta 0.02 or higher")
+    
+    # Explain KL method
+    if config.kl_beta > 0:
+        if config.kl_method == "full":
+            logger.info(f"  KL method 'full': True KL(π||π_ref) = Σ π(a)·log(π(a)/π_ref(a)) [always ≥ 0, accurate]")
+        elif config.kl_method == "sample_squared":
+            logger.info(f"  KL method 'sample_squared': 0.5·(log(π/π_ref))² [always ≥ 0, cheap approx]")
+        elif config.kl_method == "sample_abs":
+            logger.info(f"  KL method 'sample_abs': |log(π/π_ref)| [always ≥ 0, cheap approx]")
     if use_ddp:
         logger.info(f"  DDP: world_size={world_size}, local_rank={local_rank}")
 
@@ -3003,6 +3211,7 @@ def train_on_samples(
         "skipped_error": 0,
         "skipped_zero_weight": 0,
         "total_kl": 0.0,
+        "total_kl_abs": 0.0,  # Absolute KL for diagnostics
         "num_kl": 0,
         "adv_mean": adv_mean,
         "adv_mean_abs": adv_mean_abs,
@@ -3015,6 +3224,7 @@ def train_on_samples(
 
     accumulated_loss = 0.0
     accumulated_steps = 0
+    kl_fallback_warned = False
     optimizer.zero_grad()
     
     # Throughput tracking
@@ -3134,7 +3344,28 @@ def train_on_samples(
         "max_abs": 0.0,
         "clipped_tokens": 0,
         "zero_weight_samples": 0,
+        # Step reward diagnostics (BEFORE scaling)
+        "raw_step_R_sum": 0.0,
+        "raw_step_R_count": 0,
+        "raw_step_R_min": float('inf'),
+        "raw_step_R_max": float('-inf'),
     }
+    
+    # Collect raw step reward stats across all samples
+    for s in tokenized_samples:
+        for sr in s.get("step_rewards", []):
+            R = float(sr.get("R", 0.0))
+            weight_diag["raw_step_R_sum"] += R
+            weight_diag["raw_step_R_count"] += 1
+            weight_diag["raw_step_R_min"] = min(weight_diag["raw_step_R_min"], R)
+            weight_diag["raw_step_R_max"] = max(weight_diag["raw_step_R_max"], R)
+    
+    if weight_diag["raw_step_R_count"] > 0:
+        raw_R_mean = weight_diag["raw_step_R_sum"] / weight_diag["raw_step_R_count"]
+        logger.info(f"  📊 Raw step rewards R(s) BEFORE scaling:")
+        logger.info(f"     Count: {weight_diag['raw_step_R_count']} | Mean: {raw_R_mean:.6f} | "
+                   f"Min: {weight_diag['raw_step_R_min']:.6f} | Max: {weight_diag['raw_step_R_max']:.6f}")
+        logger.info(f"     step_reward_scale={config.step_reward_scale}, leaf_advantage_scale={config.leaf_advantage_scale}")
     
     # Process in mini-batches
     num_batches = (len(tokenized_samples) + micro_batch_size - 1) // micro_batch_size
@@ -3225,6 +3456,15 @@ def train_on_samples(
                 # Pad weights
                 weights = F.pad(weights, (0, max_len - 1 - len(weights)), value=0.0)
                 batch_weights.append(weights)
+                
+                # Build assistant token mask for KL (covers ALL assistant tokens, not just weighted ones)
+                # This prevents drift on unmapped/unrewarded assistant tokens
+                assistant_mask = torch.zeros(s["seq_len"] - 1, dtype=torch.bool, device="cpu")
+                for (st, en) in adjusted_boundaries:
+                    assistant_mask[st:en] = True
+                assistant_mask = F.pad(assistant_mask, (0, max_len - 1 - len(assistant_mask)), value=False)
+                s["_assistant_mask"] = assistant_mask
+                
                 kept_samples.append(s)
 
             if not kept_samples:
@@ -3276,7 +3516,11 @@ def train_on_samples(
             loss = -weighted_log_probs.sum() / weight_mass
 
             # KL penalty vs base model (LoRA disabled)
+            # TRUE KL divergence: KL(π || π_ref) = Σ_a π(a) * [log π(a) - log π_ref(a)]
+            # This is always ≥ 0 and measures how much the policy has drifted from reference
             kl_beta = float(getattr(config, "kl_beta", 0.0) or 0.0)
+            kl_method = getattr(config, "kl_method", "full")
+            
             if kl_beta > 0:
                 peft_model = model.module if hasattr(model, "module") else model
                 if hasattr(peft_model, "disable_adapter"):
@@ -3288,25 +3532,104 @@ def train_on_samples(
                                 return_dict=True
                             )
                     ref_logits = ref_outputs.logits
-                    ref_shift_logits = ref_logits[:, :-1, :]
-                    ref_nll = F.cross_entropy(
-                        ref_shift_logits.transpose(1, 2),
-                        labels,
-                        reduction="none",
-                        ignore_index=ignore_index,
-                    )
-                    ref_log_probs = -ref_nll
-                    kl_mask = (batch_weights_device.abs() > 0)
+                    ref_shift_logits = ref_logits[:, :-1, :].to(compute_device)
+                    
+                    # Mask: compute KL on ALL assistant tokens (not just weighted ones)
+                    # This prevents drift on unmapped/unrewarded assistant tokens
+                    batch_assistant_masks = torch.stack([s["_assistant_mask"] for s in kept_samples], dim=0).to(compute_device)
+                    kl_mask = batch_assistant_masks
                     if shift_mask is not None:
                         kl_mask = kl_mask & (shift_mask > 0)
-                    kl_mass = kl_mask.sum()
+                    kl_mass = kl_mask.sum().float()
+                    
                     if kl_mass > 0:
-                        kl_token = token_log_probs - ref_log_probs
-                        kl_token = torch.clamp(kl_token, min=0.0)
-                        kl_mean = (kl_token * kl_mask).sum() / kl_mass
+                        effective_kl_method = kl_method
+                        if kl_method == "full":
+                            max_full_len = int(getattr(config, "kl_full_max_seq_len", 0) or 0)
+                            if max_full_len and int(shift_logits.shape[1]) > max_full_len:
+                                fallback = str(getattr(config, "kl_fallback_method", "sample_abs") or "sample_abs")
+                                if fallback not in ("full", "sample_squared", "sample_abs"):
+                                    fallback = "sample_abs"
+                                effective_kl_method = fallback
+                                if not kl_fallback_warned:
+                                    logger.warning(
+                                        f"  ⚠️ KL full disabled for long seq "
+                                        f"(len={int(shift_logits.shape[1])} > {max_full_len}); "
+                                        f"using {effective_kl_method}"
+                                    )
+                                    kl_fallback_warned = True
+
+                        if effective_kl_method == "full":
+                            # ============================================
+                            # TRUE KL DIVERGENCE (expensive but accurate)
+                            # KL(π || π_ref) = Σ_a π(a) * [log π(a) - log π_ref(a)]
+                            # This is ALWAYS ≥ 0
+                            # ============================================
+                            # Compute log probabilities over full vocabulary
+                            policy_log_probs = F.log_softmax(shift_logits, dim=-1)  # [B, L, V]
+                            ref_log_probs = F.log_softmax(ref_shift_logits, dim=-1)  # [B, L, V]
+                            
+                            # Policy probabilities for weighting
+                            policy_probs = policy_log_probs.exp()  # [B, L, V]
+                            
+                            # KL per token position: Σ_v π(v) * [log π(v) - log π_ref(v)]
+                            # Use the identity: KL = Σ p * log(p/q) = Σ p * (log_p - log_q)
+                            kl_per_token = (policy_probs * (policy_log_probs - ref_log_probs)).sum(dim=-1)  # [B, L]
+                            
+                            # Masked mean KL
+                            kl_mean = (kl_per_token * kl_mask).sum() / kl_mass
+                            
+                            # Clean up large tensors immediately
+                            del policy_log_probs, ref_log_probs, policy_probs, kl_per_token
+                            
+                        elif effective_kl_method == "sample_squared":
+                            # ============================================
+                            # SQUARED LOG-RATIO APPROXIMATION (cheap)
+                            # approx_kl ≈ 0.5 * (log π - log π_ref)^2
+                            # This is ALWAYS ≥ 0 (second-order Taylor approx)
+                            # ============================================
+                            ref_nll = F.cross_entropy(
+                                ref_shift_logits.transpose(1, 2),
+                                labels,
+                                reduction="none",
+                                ignore_index=ignore_index,
+                            )
+                            ref_log_probs_sampled = -ref_nll
+                            
+                            log_ratio = token_log_probs - ref_log_probs_sampled
+                            kl_per_token = 0.5 * (log_ratio ** 2)
+                            kl_mean = (kl_per_token * kl_mask).sum() / kl_mass
+                            
+                        elif effective_kl_method == "sample_abs":
+                            # ============================================
+                            # ABSOLUTE LOG-RATIO (cheap, always ≥ 0)
+                            # approx_kl = |log π - log π_ref|
+                            # ============================================
+                            ref_nll = F.cross_entropy(
+                                ref_shift_logits.transpose(1, 2),
+                                labels,
+                                reduction="none",
+                                ignore_index=ignore_index,
+                            )
+                            ref_log_probs_sampled = -ref_nll
+                            
+                            log_ratio = token_log_probs - ref_log_probs_sampled
+                            kl_per_token = log_ratio.abs()
+                            kl_mean = (kl_per_token * kl_mask).sum() / kl_mass
+                            
+                        else:
+                            raise ValueError(f"Unknown kl_method: {effective_kl_method}")
+                        
+                        # Add KL penalty to loss (kl_mean is always ≥ 0 now)
                         loss = loss + (kl_beta * kl_mean)
+                        
+                        # Track KL for diagnostics
                         metrics["total_kl"] += float(kl_mean.item()) * len(kept_samples)
+                        metrics["total_kl_abs"] += float(kl_mean.item()) * len(kept_samples)  # Same as kl_mean now
                         metrics["num_kl"] += len(kept_samples)
+                    
+                    # Clean up KL-related tensors to free memory before backward pass
+                    del ref_outputs, ref_logits, ref_shift_logits, batch_assistant_masks, kl_mask
             
             scaled_loss = loss / config.gradient_accumulation_steps
             scaled_loss.backward()
@@ -3319,6 +3642,9 @@ def train_on_samples(
             metrics["total_loss"] += float(loss.item()) * len(kept_samples)
             metrics["num_samples"] += len(kept_samples)
             
+            # Clean up assistant masks from kept_samples
+            for s in kept_samples:
+                s.pop("_assistant_mask", None)
             del batch_input_ids, batch_attention_mask, batch_weights, outputs, logits, loss, scaled_loss
             
             # Throughput logging
@@ -3401,6 +3727,7 @@ def train_on_samples(
 
     metrics["avg_loss"] = metrics["total_loss"] / metrics["num_samples"] if metrics["num_samples"] else 0.0
     metrics["avg_kl"] = metrics["total_kl"] / metrics["num_kl"] if metrics["num_kl"] else 0.0
+    metrics["avg_kl_abs"] = metrics["total_kl_abs"] / metrics["num_kl"] if metrics["num_kl"] else 0.0
     logger.info(
         f"  Training complete: trained {metrics['num_samples']}/{len(samples)} samples "
         f"(skipped_zero_weight={metrics['skipped_zero_weight']}, "
@@ -3508,12 +3835,16 @@ def run_benchmark_evaluation(
 
             if error:
                 errors_count += 1
-                logger.debug(f"  Benchmark [{completed}/{len(benchmark_rulings)}]: {gold_code} ❌ {error}")
+                logger.warning(f"  Benchmark [{completed}/{len(benchmark_rulings)}]: {gold_code} ❌ {error}")
             elif samples:
                 all_benchmark_samples.extend(samples)
                 # Track best reward for this ruling
                 best_reward = max((s.get("leaf_reward", 0) or 0 for s in samples), default=0)
                 completed_rulings.append((gold_code, best_reward))
+            else:
+                # No samples and no explicit error - rollout returned empty
+                errors_count += 1
+                logger.warning(f"  Benchmark [{completed}/{len(benchmark_rulings)}]: {gold_code} ⚠️ No samples (rollout returned empty)")
             
             # Progress update every 15 seconds
             current_time = time.time()
@@ -4063,7 +4394,7 @@ def train(config: TreeRLConfig):
             time.sleep(3)
             free_gpu_memory(logger)
 
-            # Update adapter
+            # Update adapter with verification
             previous_adapter_path = current_adapter_path
             current_adapter_path = new_adapter_path
 
@@ -4071,6 +4402,35 @@ def train(config: TreeRLConfig):
             logger.info(f"\n--- Phase 6: Model updated ---")
             logger.info(f"  📤 Previous adapter: {previous_adapter_path or 'None'}")
             logger.info(f"  📥 New LoRA adapter: {new_adapter_path}")
+            
+            # Verify new adapter exists
+            if new_adapter_path:
+                new_adapter_config = os.path.join(new_adapter_path, "adapter_config.json")
+                if os.path.exists(new_adapter_config):
+                    logger.info(f"  ✓ New adapter verified")
+                else:
+                    logger.error(f"  ❌ New adapter not found after training!")
+            
+            # Cleanup old adapters from adapter_sync_dir to prevent confusion
+            # Keep only the most recent 3 adapters
+            try:
+                adapter_dirs = []
+                for name in os.listdir(config.adapter_sync_dir):
+                    path = os.path.join(config.adapter_sync_dir, name)
+                    if os.path.isdir(path) and name.startswith("adapter_"):
+                        mtime = os.path.getmtime(path)
+                        adapter_dirs.append((path, mtime))
+                
+                # Sort by modification time (newest first)
+                adapter_dirs.sort(key=lambda x: x[1], reverse=True)
+                
+                # Keep the 3 most recent, delete the rest
+                for old_path, _ in adapter_dirs[3:]:
+                    if old_path != current_adapter_path and old_path != previous_adapter_path:
+                        logger.info(f"  🗑️ Removing old adapter: {os.path.basename(old_path)}")
+                        _safe_rmtree(old_path)
+            except Exception as e:
+                logger.debug(f"  Could not cleanup old adapters: {e}")
 
             batch_metrics = {
                 "epoch": epoch + 1,
@@ -4105,6 +4465,9 @@ def train(config: TreeRLConfig):
                 "adv_min": float(train_metrics.get("adv_min", 0.0)),
                 "adv_max": float(train_metrics.get("adv_max", 0.0)),
                 "adv_std": float(train_metrics.get("adv_std", 0.0)),
+                # KL divergence metrics
+                "kl_mean": float(train_metrics.get("avg_kl", 0.0)),
+                "kl_abs_mean": float(train_metrics.get("avg_kl_abs", 0.0)),
             }, step=global_batch_num, prefix="batch")
 
             # Per-ruling advantage table + histogram (full debug)
@@ -4200,7 +4563,7 @@ def train(config: TreeRLConfig):
             logger.info(f"  Samples: {len(all_batch_samples)}")
             logger.info(f"  Trained: {train_metrics.get('num_samples', 0)}")
             logger.info(f"  Loss: {avg_loss:.4f}")
-            logger.info(f"  Avg KL: {train_metrics.get('avg_kl', 0.0):.4f}")
+            logger.info(f"  KL divergence: mean={train_metrics.get('avg_kl', 0.0):.4f}, |mean|={train_metrics.get('avg_kl_abs', 0.0):.4f}")
             logger.info(f"  Exact match: {accuracy_metrics['exact_match_rate']:.1%}")
             logger.info(f"  Time: {batch_time:.1f}s ({batch_time/60:.1f}m)")
             logger.info(f"{'─' * 50}")
@@ -4277,8 +4640,8 @@ def main():
     parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp8"],
                         help="vLLM inference dtype (serving). Merges are done into BF16.")
 
-    parser.add_argument("--sft-adapter", type=str, default="orlandowhite/nemotron3_nano_sft", 
-                        help="Starting LoRA adapter (HuggingFace repo or local path)")
+    parser.add_argument("--sft-adapter", type=str, default="", 
+                        help="Starting LoRA adapter (HuggingFace repo or local path). Empty = fresh start.")
     parser.add_argument("--no-sft-adapter", "--fresh-start", action="store_true",
                         help="Start from fresh LoRA (no SFT adapter), train from base model")
 
@@ -4317,7 +4680,7 @@ def main():
                         help="DDP backend (nccl for GPU, gloo for CPU)")
 
     # Training args
-    parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate (increased from 5e-6, requires KL penalty)")
     parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--micro-batch-size", type=int, default=1, help="Samples per forward pass (batched training)")
 
@@ -4342,14 +4705,17 @@ def main():
     parser.add_argument("--gdpo-reward-weights", type=str, default="1.0,1.0")
 
     # Reward/advantage scaling (stability knobs)
-    parser.add_argument("--step-reward-scale", type=float, default=1.0,
+    parser.add_argument("--step-reward-scale", type=float, default=10.0,
                         help="Multiply TreeRL step rewards R(s) by this factor (helps avoid tiny gradients)")
     parser.add_argument("--leaf-advantage-scale", type=float, default=1.0,
                         help="When advantage_method!=none, multiply leaf advantages by this factor")
     parser.add_argument("--token-weight-clip", type=float, default=0.0,
                         help="Clip final per-token weights to [-clip, clip] (0 disables)")
-    parser.add_argument("--kl-beta", type=float, default=0.02,
+    parser.add_argument("--kl-beta", type=float, default=0.1,
                         help="KL penalty coefficient vs base model (LoRA disabled)")
+    parser.add_argument("--kl-method", type=str, default="sample_abs",
+                        choices=["full", "sample_squared", "sample_abs"],
+                        help="KL computation method: full (true KL, expensive), sample_squared (0.5*log_ratio^2), sample_abs (|log_ratio|)")
 
     # Data args
     parser.add_argument("--chapter", type=str, default="84", help="HTS chapter to train on")
@@ -4415,6 +4781,7 @@ def main():
         leaf_advantage_scale=args.leaf_advantage_scale,
         token_weight_clip=args.token_weight_clip,
         kl_beta=args.kl_beta,
+        kl_method=args.kl_method,
         chapter=args.chapter,
         cross_rulings_file=args.cross_rulings_file,
         train_all=args.train_all,
